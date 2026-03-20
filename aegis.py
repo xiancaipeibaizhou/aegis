@@ -117,7 +117,7 @@ class SpatialEntropyGating(nn.Module):
     """
     ✨ 利用宏观图结构熵，动态决定信任 Macro-GNN (拓扑) 还是 Micro-GNN (特征)。
     """
-
+    # ✅ 这里只有 hidden_dim，绝对没有 in_channels 或 out_channels
     def __init__(self, hidden_dim):
         super().__init__()
         # SiLU (Swish) 保留负梯度，平滑融合边界
@@ -134,8 +134,8 @@ class SpatialEntropyGating(nn.Module):
         graph_entropy: [1] (当前帧的全局标量熵)
         """
         N = x_macro.size(0)
-        # 将全局熵展平给每个节点
-        entropy_expanded = graph_entropy.expand(N, 1)
+        # 加上 .view(1, 1) 防止 0-d 展开报错
+        entropy_expanded = graph_entropy.view(1, 1).expand(N, 1)
 
         gate_input = torch.cat([x_macro, x_micro, entropy_expanded], dim=-1)
         alpha = self.gate(gate_input)  # [N, 1]
@@ -153,11 +153,11 @@ class AdaptiveTemporalInception(nn.Module):
     ✨ 核心创新：熵调节的自适应多尺度时序卷积 (Entropy-Regulated Selective Kernel)
     模型根据输入序列特征和全图结构熵，自适应地动态融合不同大小感受野的卷积核输出。
     """
-
-    def __init__(self, in_channels, out_channels):
+    # ✅ 这里才是接收 in_channels, out_channels 和 kernels 的地方！
+    def __init__(self, in_channels, out_channels, kernels=None):
         super().__init__()
-        # 预置全覆盖的卷积核池 (从小到大，覆盖瞬时与长周期特性)
-        self.kernels = [1, 3, 5, 7, 9, 11]
+        # 接收外部传入的池子，或者默认全覆盖
+        self.kernels = kernels if kernels is not None else [1, 3, 5, 7, 9, 11]
 
         # 多尺度卷积分支 (使用 BatchNorm1d 兼容动态序列长度)
         self.convs = nn.ModuleList([
@@ -180,10 +180,6 @@ class AdaptiveTemporalInception(nn.Module):
         self.final_act = nn.GELU()
 
     def forward(self, x, graph_entropy):
-        """
-        x: [Num_Unique_Nodes, Channel, Time]
-        graph_entropy: [Num_Unique_Nodes, 1]
-        """
         B, C, T = x.shape
 
         # 1. 多尺度特征提取
@@ -213,7 +209,7 @@ class AdaptiveTemporalInception(nn.Module):
 # ==========================================
 class AEGIS(nn.Module):
     def __init__(self, node_in, edge_in, hidden, num_classes, seq_len=10, heads=8, dropout=0.3, max_cl_edges=2048,
-                 drop_path=0.1, dropedge_p=0.2, **kwargs):
+                 drop_path=0.1, dropedge_p=0.2, kernels=None, **kwargs):
         super(AEGIS, self).__init__()
         self.hidden = hidden
         self.seq_len = seq_len
@@ -243,7 +239,7 @@ class AEGIS(nn.Module):
 
         # --- Phase 3: 统一自适应时序层 (Adaptive Temporal Inception) ---
         self.tpe = nn.Embedding(seq_len, hidden)
-        self.stream_temporal = AdaptiveTemporalInception(hidden, hidden)
+        self.stream_temporal = AdaptiveTemporalInception(hidden, hidden, kernels=kernels)
 
         # --- Phase 4 & 5: Readout & Contrastive Head ---
         self.proj_head = nn.Sequential(nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, hidden))

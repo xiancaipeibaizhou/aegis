@@ -46,11 +46,14 @@ def plot_training_history(log_file_path, save_path, title_name="Training History
     
     ax1.set_xlabel('Epochs', fontsize=14, fontweight='bold')
     ax1.set_ylabel('Loss', color='black', fontsize=14, fontweight='bold') 
-    
+
+    mark_interval = max(1, len(epochs) // 10)
     # 画 Total Loss 和 CL Loss
-    l1 = ax1.plot(epochs, losses, color=color1, label='Total Loss', linewidth=2.5, marker='o', markersize=5, alpha=0.9)
-    # 在图例中使用 LaTeX 语法标注 CL Loss
-    l2 = ax1.plot(epochs, cl_losses, color=color2, label='Contrastive Loss ($\\mathcal{L}_{CL}$)', linewidth=2.5, linestyle='--', marker='^', markersize=5, alpha=0.9)
+    l1 = ax1.plot(epochs, losses, color=color1, label='Total Loss', linewidth=2.5, 
+                  marker='o', markersize=5, alpha=0.9, markevery=mark_interval)
+                  
+    l2 = ax1.plot(epochs, cl_losses, color=color2, label='Contrastive Loss ($\\mathcal{L}_{CL}$)', 
+                  linewidth=2.5, linestyle='--', marker='^', markersize=5, alpha=0.9, markevery=mark_interval)
     
     ax1.tick_params(axis='y', labelsize=12)
     ax1.tick_params(axis='x', labelsize=12)
@@ -63,7 +66,8 @@ def plot_training_history(log_file_path, save_path, title_name="Training History
     ax2.set_ylabel(metric_name, color=color3, fontsize=14, fontweight='bold')
     
     # 画验证集指标
-    l3 = ax2.plot(epochs, val_metrics, color=color3, label=metric_name, linewidth=2.5, marker='s', markersize=5, alpha=0.9)
+    l3 = ax2.plot(epochs, val_metrics, color=color3, label=metric_name, 
+                  linewidth=2.5, marker='s', markersize=5, alpha=0.9, markevery=mark_interval)
     ax2.tick_params(axis='y', labelcolor=color3, labelsize=12)
     
     # 动态设置右侧 Y 轴范围，留出顶部 15% 空间防止图例遮挡曲线

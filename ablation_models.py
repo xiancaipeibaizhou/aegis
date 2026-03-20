@@ -59,9 +59,9 @@ class NormalGraphAttention(MessagePassing):
 # ==========================================
 class FixedTemporalInception(nn.Module):
     """移除基于图结构熵的自适应门控，将不同感受野的权重固定为均值"""
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, in_channels, out_channels, kernels=None):
         super().__init__()
-        self.kernels = [1, 3, 5, 7, 9, 11]
+        self.kernels = kernels if kernels is not None else [1, 3, 5, 7, 9, 11]
         self.convs = nn.ModuleList([
             nn.Sequential(
                 nn.Conv1d(in_channels, out_channels, kernel_size=k, padding=k//2),
@@ -243,7 +243,7 @@ class AEGIS_WoMacro(BaseAblationAEGIS):
                 'edge_upd': EdgeUpdaterModule(self.hidden, self.hidden, self.hidden, kwargs.get('dropout', 0.3))
             }) for _ in range(self.num_layers)
         ])
-        self.stream_temporal = AdaptiveTemporalInception(self.hidden, self.hidden)
+        self.stream_temporal = AdaptiveTemporalInception(self.hidden, self.hidden, kernels=kwargs.get('kernels'))
 
     def _spatial_encode_one_frame(self, data, dropedge_p):
         x_base, e_micro, edge_index_d, edge_mask, batch, frame_global_ids, graph_entropy_scalar = self._prepare_spatial_data(data, dropedge_p)
@@ -261,7 +261,7 @@ class AEGIS_WoMicro(BaseAblationAEGIS):
         super().__init__(*args, **kwargs)
         self.num_layers = 2
         self.macro_spatial_layers = nn.ModuleList([MacroTopologyGNN(self.hidden, kwargs.get('dropout', 0.3)) for _ in range(self.num_layers)])
-        self.stream_temporal = AdaptiveTemporalInception(self.hidden, self.hidden)
+        self.stream_temporal = AdaptiveTemporalInception(self.hidden, self.hidden, kernels=kwargs.get('kernels'))
 
     def _spatial_encode_one_frame(self, data, dropedge_p):
         x_base, e_micro, edge_index_d, edge_mask, batch, frame_global_ids, graph_entropy_scalar = self._prepare_spatial_data(data, dropedge_p)
@@ -284,7 +284,7 @@ class AEGIS_WoSpatialGating(BaseAblationAEGIS):
                 'edge_upd': EdgeUpdaterModule(self.hidden, self.hidden, self.hidden, kwargs.get('dropout', 0.3))
             }) for _ in range(self.num_layers)
         ])
-        self.stream_temporal = AdaptiveTemporalInception(self.hidden, self.hidden)
+        self.stream_temporal = AdaptiveTemporalInception(self.hidden, self.hidden, kernels=kwargs.get('kernels'))
 
     def _spatial_encode_one_frame(self, data, dropedge_p):
         x_base, e_micro, edge_index_d, edge_mask, batch, frame_global_ids, graph_entropy_scalar = self._prepare_spatial_data(data, dropedge_p)
@@ -315,7 +315,7 @@ class AEGIS_WoEdgeAug(BaseAblationAEGIS):
             }) for _ in range(self.num_layers)
         ])
         self.spatial_gating = SpatialEntropyGating(self.hidden)
-        self.stream_temporal = AdaptiveTemporalInception(self.hidden, self.hidden)
+        self.stream_temporal = AdaptiveTemporalInception(self.hidden, self.hidden, kernels=kwargs.get('kernels'))
 
     def _spatial_encode_one_frame(self, data, dropedge_p):
         x_base, e_micro, edge_index_d, edge_mask, batch, frame_global_ids, graph_entropy_scalar = self._prepare_spatial_data(data, dropedge_p)
@@ -349,7 +349,7 @@ class AEGIS_FixedTemporal(BaseAblationAEGIS):
         self.spatial_gating = SpatialEntropyGating(self.hidden)
         
         # 替换为固定感受野时序模块
-        self.stream_temporal = FixedTemporalInception(self.hidden, self.hidden)
+        self.stream_temporal = FixedTemporalInception(self.hidden, self.hidden, kernels=kwargs.get('kernels'))
 
     def _spatial_encode_one_frame(self, data, dropedge_p):
         x_base, e_micro, edge_index_d, edge_mask, batch, frame_global_ids, graph_entropy_scalar = self._prepare_spatial_data(data, dropedge_p)
