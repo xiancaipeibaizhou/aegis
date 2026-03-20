@@ -23,8 +23,8 @@ from tqdm import tqdm
 from hparams_a3 import resolve_hparams
 from aegis import AEGIS
 from ablation_models import (
-    MILAN_WoGlobal, MILAN_WoLocal, MILAN_WoGating, 
-    MILAN_WoEdgeAug, MILAN_StandardTransformer
+    AEGIS_WoMacro, AEGIS_WoMicro, AEGIS_WoSpatialGating, 
+    AEGIS_WoEdgeAug, AEGIS_FixedTemporal
 )
 
 # 默认开启 PyTorch 的 TF32 硬件加速 (4090 的默认神技，FP32精度+FP16速度)
@@ -219,7 +219,7 @@ def main():
     parser.add_argument('--dataset', type=str, default='unsw_nb15')
     parser.add_argument('--data_dir', type=str, default='../processed_data')
     parser.add_argument('--variant', type=str, default='AEGIS',
-                        choices=['AEGIS', 'WoGlobal', 'WoLocal', 'WoGating', 'WoEdgeAug', 'StandardTransformer'])
+                        choices=['AEGIS', 'WoMacro', 'WoMicro', 'WoSpatialGating', 'WoEdgeAug', 'FixedTemporal'])
     # 允许传入已预训练好的底座路径
     parser.add_argument('--pretrained_path', type=str, default='', help='Path to pre-trained backbone model')
     # 单独预训练开关
@@ -284,11 +284,11 @@ def main():
     
     print(f"🚀 Initializing Model Variant: {args.variant}")
     if args.variant == "AEGIS": model = AEGIS(**model_kwargs).to(device)
-    elif args.variant == "WoGlobal": model = MILAN_WoGlobal(**model_kwargs).to(device)
-    elif args.variant == "WoLocal": model = MILAN_WoLocal(**model_kwargs).to(device)
-    elif args.variant == "WoGating": model = MILAN_WoGating(**model_kwargs).to(device)
-    elif args.variant == "WoEdgeAug": model = MILAN_WoEdgeAug(**model_kwargs).to(device)
-    elif args.variant == "StandardTransformer": model = MILAN_StandardTransformer(**model_kwargs).to(device)
+    elif args.variant == "WoMacro": model = AEGIS_WoMacro(**model_kwargs).to(device)
+    elif args.variant == "WoMicro": model = AEGIS_WoMicro(**model_kwargs).to(device)
+    elif args.variant == "WoSpatialGating": model = AEGIS_WoSpatialGating(**model_kwargs).to(device)
+    elif args.variant == "WoEdgeAug": model = AEGIS_WoEdgeAug(**model_kwargs).to(device)
+    elif args.variant == "FixedTemporal": model = AEGIS_FixedTemporal(**model_kwargs).to(device)
 
     # ==========================================
     # 🔥 Phase 1: Generative Subgraph Pre-training (无监督)
@@ -397,7 +397,7 @@ def main():
             total_ce += ce_loss.item()
                 
             if ((step + 1) % accum_steps == 0) or ((step + 1) == len(train_loader)):
-                torch.nn.utils.clip_grad_norm_(model.classifier.parameters(), max_norm=2.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
                 optimizer_ft.step()
                 optimizer_ft.zero_grad(set_to_none=True)
 
@@ -473,7 +473,7 @@ def main():
         for log_line in training_log:
             f.write(log_line + "\n")
             
-    csv_file = "milan_ablations_results.csv" 
+    csv_file = "aegis_results.csv" 
     if not os.path.isfile(csv_file):
         with open(csv_file, "w") as f:
             f.write("Dataset,Variant,Group,Threshold,ACC,APR,RE,F1_Macro,F1_Weighted,AUC,ASA,FAR\n")
