@@ -411,7 +411,17 @@ def main():
         if num_classes == 2:
             val_true_bin = np.hstack((1 - val_true_bin, val_true_bin))
             
-        val_auprc_macro = average_precision_score(val_true_bin, val_probs, average='macro')
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # 屏蔽验证集没有正样本时的烦人警告
+            try:
+                val_auprc_macro = average_precision_score(val_true_bin, val_probs, average='macro')
+                # 如果依然算出 NaN (全是正常流量)，则安全置为 0.0，防止破坏早停判断
+                if np.isnan(val_auprc_macro):
+                    val_auprc_macro = 0.0
+            except Exception:
+                val_auprc_macro = 0.0
+                
         val_preds_raw = np.argmax(val_probs, axis=-1)
         val_f1_macro = f1_score(val_true, val_preds_raw, average='macro', zero_division=0)
         

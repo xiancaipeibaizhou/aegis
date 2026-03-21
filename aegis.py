@@ -242,9 +242,8 @@ class AEGIS(nn.Module):
         self.stream_temporal = AdaptiveTemporalInception(hidden, hidden, kernels=kernels)
 
         # --- Phase 4 & 5: Readout & Contrastive Head ---
-        self.proj_head = nn.Sequential(nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, hidden))
-        self.reconstruct_head = nn.Sequential(nn.Linear(hidden * 3, hidden * 2), nn.ReLU(),
-                                              nn.Linear(hidden * 2, hidden))
+        
+        self.reconstruct_head = nn.Sequential(nn.Linear(hidden * 3, hidden * 2), nn.ReLU(), nn.Linear(hidden * 2, hidden))
         self.classifier = nn.Sequential(
             nn.Linear(hidden * 3, hidden * 2), nn.LayerNorm(hidden * 2),
             nn.GELU(), nn.Dropout(dropout), nn.Linear(hidden * 2, num_classes)
@@ -371,15 +370,27 @@ class AEGIS(nn.Module):
                     else:
                         edge_rep_sampled = edge_rep
 
-                    z1 = F.normalize(self.reconstruct_head(edge_rep_sampled), dim=1)
-                    z2 = F.normalize(self.proj_head(edge_feat_anchor), dim=1)
-                    logits = torch.matmul(z1, z2.T) / 0.1
-                    labels = torch.arange(z1.size(0), device=device)
-                    base_cl_loss = F.cross_entropy(logits, labels)
+                    current_entropy = batch_graph_entropies[t].mean()
+                    # 基础掩码率 15%，网络越混乱(熵越高)，掩码率越大，最高可达 60%
+                    dynamic_mask_ratio = torch.clamp(0.15 + 0.45 * torch.tanh(current_entropy), min=0.15, max=0.60)
+                    
+                    # ✨ 2. 特征级掩码投毒 (Feature Masking)
+                    # 模拟真实网络中的丢包、传感器失效或攻击者特征混淆
+                    mask = (torch.rand_like(edge_rep_sampled) > dynamic_mask_ratio).float()
+                    corrupted_rep = edge_rep_sampled * mask
+                    
+                    # ✨ 3. 掩码解码重构 (Masked Reconstruction)
+                    # 强迫模型从被破坏的时空上下文中，还原出纯净的原始物理空间特征
+                    reconstructed = self.reconstruct_head(corrupted_rep)
+                    target_feat = edge_feat_anchor.detach() # 作为绝对的物理真值 (Ground Truth)
+                    
+                    # ✨ 4. MSE 重构损失 (Mean Squared Error)
+                    base_cl_loss = F.mse_loss(reconstructed, target_feat)
 
-                    # ✨ 熵正则化 CL Loss 放大：利用当前帧局部熵动态控制泛化目标
-                    dynamic_cl_scale = 1.0 + torch.tanh(batch_graph_entropies[t])
+                    # ✨ 5. 熵正则化 Loss 放大：环境越混乱，越依赖底层无监督物理规律
+                    dynamic_cl_scale = 1.0 + torch.tanh(current_entropy)
                     cl_loss = base_cl_loss * dynamic_cl_scale
+                    
                 else:
                     cl_loss = torch.tensor(0.0, device=device)
 
