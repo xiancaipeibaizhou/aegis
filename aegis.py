@@ -2,16 +2,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import MessagePassing, GraphNorm, SAGEConv
-from torch_geometric.utils import softmax, degree, dropout_edge
-import math
-
+from torch_geometric.utils import softmax, degree
 
 # ==========================================
-# 0. 基础组件: DropPath (随机深度)
+# 0. 基础组件
 # ==========================================
 class DropPath(nn.Module):
-    """Stochastic Depth: 在训练时随机丢弃残差路径，增强泛化能力"""
-
+    """注: 这里的实现类似于 Node-wise residual dropout, 用于增强节点级表征的泛化"""
     def __init__(self, drop_prob=0.0):
         super(DropPath, self).__init__()
         self.drop_prob = drop_prob
@@ -25,10 +22,8 @@ class DropPath(nn.Module):
         random_tensor.floor_()
         return x.div(keep_prob) * random_tensor
 
-
 # ==========================================
-# 1. 空间组件 A: 宏观拓扑提取器 (Macro-Topology GNN)
-# 抛弃边特征，纯粹利用图的连通性捕捉宏观异常拓扑 (如 DDoS, 端口扫描)
+# 1. 空间组件
 # ==========================================
 class MacroTopologyGNN(nn.Module):
     def __init__(self, hidden_dim, dropout=0.1):
@@ -43,29 +38,48 @@ class MacroTopologyGNN(nn.Module):
         out = self.conv(x, edge_index)
         out = self.norm(out, batch)
         out = self.act(out)
-        out = self.dropout(out)
-        return out + residual
+        return self.dropout(out) + residual
 
+class NormalGraphAttention(MessagePassing):
+    def __init__(self, in_dim, out_dim, heads=4, dropout=0.1, drop_path=0.1):
+        super().__init__(node_dim=0, aggr='add')
+        if out_dim % heads != 0:
+            raise ValueError(f"out_dim={out_dim} must be divisible by heads={heads}")
+        self.out_dim, self.heads, self.head_dim = out_dim, heads, out_dim // heads
+        self.dropout = dropout
+        self.WQ = nn.Linear(in_dim, out_dim, bias=False)
+        self.WK = nn.Linear(in_dim, out_dim, bias=False)
+        self.WV = nn.Linear(in_dim, out_dim, bias=False)
+        self.out_proj = nn.Linear(out_dim, out_dim)
+        self.norm = GraphNorm(out_dim)
+        self.drop_path = DropPath(drop_path)
+        self.act = nn.GELU()
 
-# ==========================================
-# 2. 空间组件 B: 微观交互提取器 (Micro-Interaction GNN)
-# 包含边增强注意力和边更新，深挖细粒度的流量行为语义 (如 APT, SQL注入)
-# ==========================================
+    def forward(self, x, edge_index, batch=None):
+        residual = x
+        q = self.WQ(x).view(-1, self.heads, self.head_dim)
+        k = self.WK(x).view(-1, self.heads, self.head_dim)
+        v = self.WV(x).view(-1, self.heads, self.head_dim)
+        out = self.propagate(edge_index, q=q, k=k, v=v, size=None)
+        out = self.norm(self.out_proj(out.view(-1, self.out_dim)) + self.drop_path(residual), batch)
+        return self.act(out)
+
+    def message(self, q_i, k_j, v_j, index):
+        score = (q_i * k_j).sum(dim=-1) / (self.head_dim ** 0.5)
+        alpha = F.dropout(softmax(score, index), p=self.dropout, training=self.training)
+        return alpha.unsqueeze(-1) * v_j
+
 class EdgeAugmentedAttention(MessagePassing):
     def __init__(self, in_dim, out_dim, edge_dim, heads=4, dropout=0.1, drop_path=0.1):
         super().__init__(node_dim=0, aggr='add')
-        self.in_dim = in_dim
-        self.out_dim = out_dim
-        self.edge_dim = edge_dim
-        self.heads = heads
-        self.head_dim = out_dim // heads
+        if out_dim % heads != 0:
+            raise ValueError(f"out_dim={out_dim} must be divisible by heads={heads}")
+        self.out_dim, self.heads, self.head_dim = out_dim, heads, out_dim // heads
         self.dropout = dropout
-
         self.WQ = nn.Linear(in_dim, out_dim, bias=False)
         self.WK = nn.Linear(in_dim, out_dim, bias=False)
         self.WV = nn.Linear(in_dim, out_dim, bias=False)
         self.WE = nn.Linear(edge_dim, out_dim, bias=False)
-
         self.out_proj = nn.Linear(out_dim, out_dim)
         self.norm = GraphNorm(out_dim)
         self.drop_path = DropPath(drop_path)
@@ -77,19 +91,14 @@ class EdgeAugmentedAttention(MessagePassing):
         k = self.WK(x).view(-1, self.heads, self.head_dim)
         v = self.WV(x).view(-1, self.heads, self.head_dim)
         e_emb = self.WE(edge_attr).view(-1, self.heads, self.head_dim)
-
         out = self.propagate(edge_index, q=q, k=k, v=v, e_emb=e_emb, size=None)
-        out = out.view(-1, self.out_dim)
-        out = self.out_proj(out)
-        out = self.norm(out + self.drop_path(residual), batch)
+        out = self.norm(self.out_proj(out.view(-1, self.out_dim)) + self.drop_path(residual), batch)
         return self.act(out)
 
     def message(self, q_i, k_j, v_j, e_emb, index):
         score = (q_i * (k_j + e_emb)).sum(dim=-1) / (self.head_dim ** 0.5)
-        alpha = softmax(score, index)
-        alpha = F.dropout(alpha, p=self.dropout, training=self.training)
+        alpha = F.dropout(softmax(score, index), p=self.dropout, training=self.training)
         return alpha.unsqueeze(-1) * (v_j + e_emb)
-
 
 class EdgeUpdaterModule(nn.Module):
     def __init__(self, node_dim, edge_dim, hidden_dim, dropout=0.1):
@@ -105,218 +114,241 @@ class EdgeUpdaterModule(nn.Module):
     def forward(self, x, edge_index, edge_attr):
         src, dst = edge_index
         cat_feat = torch.cat([x[src], x[dst], edge_attr], dim=-1)
-        update = self.mlp(cat_feat)
-        gate = self.hetero_gate(cat_feat)
-        return self.norm(update * gate + edge_attr)
+        return self.norm(self.mlp(cat_feat) * self.hetero_gate(cat_feat) + edge_attr)
 
-
-# ==========================================
-# 3. 空间门控融合: 基于图结构熵的双空间解耦融合
-# ==========================================
 class SpatialEntropyGating(nn.Module):
-    """
-    ✨ 利用宏观图结构熵，动态决定信任 Macro-GNN (拓扑) 还是 Micro-GNN (特征)。
-    """
-    # ✅ 这里只有 hidden_dim，绝对没有 in_channels 或 out_channels
     def __init__(self, hidden_dim):
         super().__init__()
-        # SiLU (Swish) 保留负梯度，平滑融合边界
         self.gate = nn.Sequential(
-            nn.Linear(hidden_dim * 2 + 1, hidden_dim // 2),
-            nn.SiLU(),
-            nn.Linear(hidden_dim // 2, 1),
-            nn.Sigmoid()
+            nn.Linear(hidden_dim * 2 + 1, hidden_dim // 2), nn.SiLU(),
+            nn.Linear(hidden_dim // 2, 1), nn.Sigmoid()
         )
 
-    def forward(self, x_macro, x_micro, graph_entropy):
-        """
-        x_macro/x_micro: [Num_Nodes, Hidden]
-        graph_entropy: [1] (当前帧的全局标量熵)
-        """
-        N = x_macro.size(0)
-        # 加上 .view(1, 1) 防止 0-d 展开报错
-        entropy_expanded = graph_entropy.view(1, 1).expand(N, 1)
-
-        gate_input = torch.cat([x_macro, x_micro, entropy_expanded], dim=-1)
-        alpha = self.gate(gate_input)  # [N, 1]
-
-        # 融合机制：α*Macro + (1-α)*Micro
-        out = alpha * x_macro + (1 - alpha) * x_micro
-        return out, alpha
-
+    def forward(self, x_macro, x_micro, node_irregularity):
+        # 使用真实的局部节点不规则度作为门控提示
+        gate_input = torch.cat([x_macro, x_micro, node_irregularity.view(-1, 1)], dim=-1)
+        alpha = self.gate(gate_input)
+        return alpha * x_macro + (1 - alpha) * x_micro, alpha
 
 # ==========================================
-# 4. 统一时序组件: 熵调节自适应多尺度卷积 (ER-SKNet)
+# 2. 时序组件 (含 Fixed 变体)
 # ==========================================
 class AdaptiveTemporalInception(nn.Module):
-    """
-    ✨ 核心创新：熵调节的自适应多尺度时序卷积 (Entropy-Regulated Selective Kernel)
-    模型根据输入序列特征和全图结构熵，自适应地动态融合不同大小感受野的卷积核输出。
-    """
-    # ✅ 这里才是接收 in_channels, out_channels 和 kernels 的地方！
     def __init__(self, in_channels, out_channels, kernels=None):
         super().__init__()
-        # 接收外部传入的池子，或者默认全覆盖
         self.kernels = kernels if kernels is not None else [1, 3, 5, 7, 9, 11]
-
-        # 多尺度卷积分支 (使用 BatchNorm1d 兼容动态序列长度)
         self.convs = nn.ModuleList([
             nn.Sequential(
                 nn.Conv1d(in_channels, out_channels, kernel_size=k, padding=k // 2),
-                nn.BatchNorm1d(out_channels),
-                nn.GELU()
+                nn.BatchNorm1d(out_channels), nn.GELU()
             ) for k in self.kernels
         ])
-
-        # 1D 全局平均池化，提取序列的时序特征摘要
         self.gap = nn.AdaptiveAvgPool1d(1)
-
-        # 自适应核选择的注意力网络 (Gate)
         self.fc1 = nn.Linear(out_channels + 1, out_channels // 2)
-        self.act = nn.SiLU()  # Swish 函数
+        self.act = nn.SiLU()
         self.fc2 = nn.Linear(out_channels // 2, len(self.kernels))
-
         self.project = nn.Conv1d(in_channels, out_channels, kernel_size=1)
         self.final_act = nn.GELU()
 
-    def forward(self, x, graph_entropy):
+    def forward(self, x, global_irregularity):
         B, C, T = x.shape
-
-        # 1. 多尺度特征提取
         U = [conv(x) for conv in self.convs]
-        U_stack = torch.stack(U, dim=1)  # [B, Num_Kernels, C, T]
+        U_stack = torch.stack(U, dim=1)
+        
+        s = self.gap(U_stack.sum(dim=1)).squeeze(-1)
+        z = torch.cat([s, global_irregularity], dim=-1)
+        attn_weights = F.softmax(self.fc2(self.act(self.fc1(z))), dim=-1)
+        
+        V = (U_stack * attn_weights.view(B, len(self.kernels), 1, 1)).sum(dim=1)
+        return self.final_act(V + self.project(x)), attn_weights
 
-        # 2. 全局信息融合 (Global Information Extraction)
-        U_sum = U_stack.sum(dim=1)  # [B, C, T]
-        s = self.gap(U_sum).squeeze(-1)  # [B, C]
+class FixedTemporalInception(nn.Module):
+    def __init__(self, in_channels, out_channels, kernels=None):
+        super().__init__()
+        self.kernels = kernels if kernels is not None else [1, 3, 5, 7, 9, 11]
+        self.convs = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv1d(in_channels, out_channels, kernel_size=k, padding=k // 2),
+                nn.BatchNorm1d(out_channels), nn.GELU()
+            ) for k in self.kernels
+        ])
+        self.project = nn.Conv1d(in_channels, out_channels, kernel_size=1)
+        self.final_act = nn.GELU()
 
-        # 3. ✨ 注入图结构熵，计算动态感受野权重
-        z = torch.cat([s, graph_entropy], dim=-1)  # [B, C+1]
-        attn_scores = self.fc2(self.act(self.fc1(z)))  # [B, Num_Kernels]
-        attn_weights = F.softmax(attn_scores, dim=-1)  # [B, Num_Kernels]
-
-        # 4. 动态软融合 (Adaptive Soft Fusion)
-        attn_weights_view = attn_weights.view(B, len(self.kernels), 1, 1)
-        V = (U_stack * attn_weights_view).sum(dim=1)  # [B, C, T]
-
-        # 残差连接
-        out = V + self.project(x)
-        return self.final_act(out), attn_weights
-
+    def forward(self, x, global_irregularity):
+        B, C, T = x.shape
+        U = [conv(x) for conv in self.convs]
+        U_stack = torch.stack(U, dim=1)
+        attn_weights = torch.ones(B, len(self.kernels), device=x.device) / len(self.kernels)
+        V = (U_stack * attn_weights.view(B, len(self.kernels), 1, 1)).sum(dim=1)
+        return self.final_act(V + self.project(x)), attn_weights
 
 # ==========================================
-# 5. 完整模型: AEGIS (Adaptive Entropy-Guided Intrusion Shield)
+# 3. 终极主模型: AEGIS (配置化基类)
 # ==========================================
 class AEGIS(nn.Module):
     def __init__(self, node_in, edge_in, hidden, num_classes, seq_len=10, heads=8, dropout=0.3, max_cl_edges=2048,
-                 drop_path=0.1, dropedge_p=0.2, kernels=None, **kwargs):
+                 drop_path=0.1, dropedge_p=0.2, kernels=None,
+                 use_macro=True, use_micro=True, use_spatial_gating=True, use_edge_aug=True, temporal_mode="adaptive", 
+                 **kwargs):
         super(AEGIS, self).__init__()
-        self.hidden = hidden
-        self.seq_len = seq_len
-        self.max_cl_edges = max_cl_edges
-        self.dropedge_p = float(dropedge_p)
+        self.hidden, self.seq_len = hidden, seq_len
+        self.max_cl_edges, self.dropedge_p = max_cl_edges, float(dropedge_p)
+        
+        # --- 架构控制开关 ---
+        self.use_macro = use_macro
+        self.use_micro = use_micro
+        self.use_spatial_gating = use_spatial_gating
+        self.use_edge_aug = use_edge_aug
+        self.temporal_mode = temporal_mode
 
-        # 自适应特征衰减因子
-        self.decay_factor = nn.Parameter(torch.tensor(0.8))
-
-        # --- Encoders ---
         self.node_enc = nn.Sequential(nn.Linear(node_in, hidden), nn.LayerNorm(hidden))
         self.edge_enc = nn.Sequential(nn.Linear(edge_in, hidden), nn.LayerNorm(hidden))
 
-        # --- Phase 1: 双粒度空间解耦层 (Dual-Granularity Spatial Evolution) ---
+        # --- Phase 1: Spatial ---
         self.num_layers = 2
-        self.macro_spatial_layers = nn.ModuleList()
+        self.macro_spatial_layers = nn.ModuleList([MacroTopologyGNN(hidden, dropout) for _ in range(self.num_layers)])
         self.micro_spatial_layers = nn.ModuleList()
-
         for _ in range(self.num_layers):
-            self.macro_spatial_layers.append(MacroTopologyGNN(hidden, dropout))
-            self.micro_spatial_layers.append(nn.ModuleDict({
-                'node_att': EdgeAugmentedAttention(hidden, hidden, hidden, heads, dropout, drop_path=float(drop_path)),
-                'edge_upd': EdgeUpdaterModule(hidden, hidden, hidden, dropout)
-            }))
+            if self.use_edge_aug:
+                self.micro_spatial_layers.append(nn.ModuleDict({
+                    'node_att': EdgeAugmentedAttention(hidden, hidden, hidden, heads, dropout, drop_path),
+                    'edge_upd': EdgeUpdaterModule(hidden, hidden, hidden, dropout)
+                }))
+            else:
+                self.micro_spatial_layers.append(nn.ModuleDict({
+                    'node_att': NormalGraphAttention(hidden, hidden, heads, dropout, drop_path),
+                    'edge_upd': EdgeUpdaterModule(hidden, hidden, hidden, dropout)
+                }))
 
-        self.spatial_gating = SpatialEntropyGating(hidden)
+        self.spatial_gating = SpatialEntropyGating(hidden) if self.use_spatial_gating else None
 
-        # --- Phase 3: 统一自适应时序层 (Adaptive Temporal Inception) ---
+        # --- Phase 3: Temporal ---
         self.tpe = nn.Embedding(seq_len, hidden)
-        self.stream_temporal = AdaptiveTemporalInception(hidden, hidden, kernels=kernels)
+        # in_channels 为 hidden + 1，显式拼接 presence_mask
+        if self.temporal_mode == "adaptive":
+            self.stream_temporal = AdaptiveTemporalInception(hidden + 1, hidden, kernels=kernels)
+        else:
+            self.stream_temporal = FixedTemporalInception(hidden + 1, hidden, kernels=kernels)
 
-        # --- Phase 4 & 5: Readout & Contrastive Head ---
-        
+        # --- Phase 4 & 5: Readout ---
         self.reconstruct_head = nn.Sequential(nn.Linear(hidden * 3, hidden * 2), nn.ReLU(), nn.Linear(hidden * 2, hidden))
         self.classifier = nn.Sequential(
             nn.Linear(hidden * 3, hidden * 2), nn.LayerNorm(hidden * 2),
             nn.GELU(), nn.Dropout(dropout), nn.Linear(hidden * 2, num_classes)
         )
 
-    # 结构熵计算
-    def compute_structural_entropy(self, edge_index, num_nodes):
-        deg = degree(edge_index[0], num_nodes, dtype=torch.float)
-        p_i = 1.0 / (deg[edge_index[0]] + 1e-6)
-        entropy_edge = - p_i * torch.log(p_i + 1e-6)
-        return entropy_edge
+    def compute_degree_irregularity(self, edge_index, num_nodes):
+        """严格对称的节点与边不规则度 (结构熵代理)"""
+        src, dst = edge_index
+        # 将图视作无向或严格计算总度数保证对称性
+        deg_all = degree(src, num_nodes, dtype=torch.float) + degree(dst, num_nodes, dtype=torch.float)
+        
+        # 节点级局部不规则度
+        p_node = 1.0 / (deg_all + 1e-6)
+        node_irregularity = -p_node * torch.log(p_node + 1e-6)
+        
+        # 边级双端不规则度
+        p_src, p_dst = 1.0 / (deg_all[src] + 1e-6), 1.0 / (deg_all[dst] + 1e-6)
+        edge_irregularity = -0.5 * (p_src * torch.log(p_src + 1e-6) + p_dst * torch.log(p_dst + 1e-6))
+        
+        return node_irregularity, edge_irregularity
+
+    def irregularity_guided_dropedge(self, edge_index, edge_attr, edge_irregularity, dropedge_p):
+        """使用相对均值缩放，保证全局丢边率期望贴近 dropedge_p"""
+        if not self.training or float(dropedge_p) <= 0.0 or edge_index.size(1) == 0:
+            return edge_index, edge_attr, torch.ones(edge_index.size(1), dtype=torch.bool, device=edge_index.device)
+            
+        relative_irregularity = edge_irregularity / (edge_irregularity.mean() + 1e-6)
+        drop_prob = torch.clamp(float(dropedge_p) * relative_irregularity, 0.0, 1.0)
+        keep_prob = 1.0 - drop_prob
+        edge_mask = torch.rand_like(keep_prob) < keep_prob 
+        return edge_index[:, edge_mask], edge_attr[edge_mask], edge_mask
+
+    def compute_aux_loss(self, edge_rep, target_feat, global_irregularity_scalar):
+        """统一提取的辅助损失：ED-MAE (熵驱动掩码自编码器 MSE 重构)"""
+        dynamic_mask_ratio = torch.clamp(0.15 + 0.45 * torch.tanh(global_irregularity_scalar), min=0.15, max=0.60)
+        mask = (torch.rand_like(edge_rep) > dynamic_mask_ratio).float()
+        
+        corrupted_rep = edge_rep * mask
+        reconstructed = self.reconstruct_head(corrupted_rep)
+        
+        base_recon_loss = F.mse_loss(reconstructed, target_feat.detach())
+        dynamic_scale = 1.0 + torch.tanh(global_irregularity_scalar)
+        return base_recon_loss * dynamic_scale
+
+    def _spatial_encode_one_frame(self, data, dropedge_p):
+        x, edge_index, edge_attr = data.x, data.edge_index, data.edge_attr
+        batch = data.batch if hasattr(data, "batch") else None
+        x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        edge_attr = torch.nan_to_num(edge_attr, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # 🚨 严格断言全局稳定实体 ID
+        frame_global_ids = getattr(data, "global_node_id", getattr(data, "n_id", None))
+        if frame_global_ids is None:
+            raise ValueError("Missing 'global_node_id' (or 'n_id' as fallback). Temporal alignment strictly requires stable cross-frame entity IDs, not PyG local batch indices.")
+
+        node_irreg, edge_irreg = self.compute_degree_irregularity(edge_index, x.size(0))
+        graph_irreg_scalar = edge_irreg.mean() if edge_index.size(1) > 0 else torch.tensor(0.0, device=x.device)
+
+        edge_index_d, edge_attr_d, edge_mask = self.irregularity_guided_dropedge(edge_index, edge_attr, edge_irreg, dropedge_p)
+
+        x_base = self.node_enc(x)
+        e_base = self.edge_enc(edge_attr_d)
+
+        # 🌀 Stream 1: Macro
+        x_macro = x_base
+        if self.use_macro:
+            for layer in self.macro_spatial_layers:
+                x_macro = layer(x_macro, edge_index_d, batch)
+        else:
+            x_macro = torch.zeros_like(x_base)
+
+        # 🌀 Stream 2: Micro
+        x_micro, e_micro = x_base, e_base
+        if self.use_micro:
+            for layer in self.micro_spatial_layers:
+                if self.use_edge_aug:
+                    x_micro = layer["node_att"](x_micro, edge_index_d, e_micro, batch)
+                else:
+                    x_micro = layer["node_att"](x_micro, edge_index_d, batch)
+                e_micro = layer["edge_upd"](x_micro, edge_index_d, e_micro)
+        else:
+            # 严格消融微观消息传递，但 e_micro 保持 e_base 原值以供分类器做基础判断
+            x_micro = torch.zeros_like(x_base)
+
+        # 🌀 Fusion
+        if self.use_macro and self.use_micro:
+            if self.use_spatial_gating:
+                x_fused, _ = self.spatial_gating(x_macro, x_micro, node_irreg)
+            else:
+                x_fused = 0.5 * (x_macro + x_micro) # 公平量级裸加和
+        else:
+            x_fused = x_macro if self.use_macro else x_micro
+
+        return x_fused, e_micro, edge_index_d.clone(), edge_mask, frame_global_ids, graph_irreg_scalar
 
     def forward(self, graphs):
         spatial_node_feats, spatial_edge_feats = [], []
         active_edge_indices, edge_masks = [], []
-        batch_global_ids, batch_graph_entropies = [], []
-
-        # === Phase 1: Dual-Granularity Spatial Evolution ===
-        def _spatial_encode_one_frame(data, dropedge_p):
-            x, edge_index, edge_attr = data.x, data.edge_index, data.edge_attr
-            batch = data.batch if hasattr(data, "batch") else None
-            x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
-            edge_attr = torch.nan_to_num(edge_attr, nan=0.0, posinf=0.0, neginf=0.0)
-
-            frame_global_ids = data.n_id if hasattr(data, "n_id") else torch.arange(x.size(0), device=x.device)
-
-            edge_entropy = self.compute_structural_entropy(edge_index, x.size(0))
-            graph_entropy_scalar = edge_entropy.mean() if edge_index.size(1) > 0 else torch.tensor(0.0, device=x.device)
-
-            if self.training and float(dropedge_p) > 0.0 and edge_index.size(1) > 0:
-                norm_entropy = (edge_entropy - edge_entropy.min()) / (edge_entropy.max() - edge_entropy.min() + 1e-6)
-                keep_prob = 1.0 - (float(dropedge_p) * norm_entropy)
-                edge_mask = (keep_prob + torch.rand_like(keep_prob)).floor().bool()
-                edge_index_d, edge_attr_d = edge_index[:, edge_mask], edge_attr[edge_mask]
-            else:
-                edge_index_d, edge_attr_d = edge_index, edge_attr
-                edge_mask = torch.ones(edge_index.size(1), dtype=torch.bool, device=edge_index.device)
-
-            x_base = self.node_enc(x)
-            e_micro = self.edge_enc(edge_attr_d)
-
-            # 🌀 Stream 1: Macro-Topology (Pure Structural)
-            x_macro = x_base
-            for layer in self.macro_spatial_layers:
-                x_macro = layer(x_macro, edge_index_d, batch)
-
-            # 🌀 Stream 2: Micro-Interaction (Feature Intensive)
-            x_micro = x_base
-            for layer in self.micro_spatial_layers:
-                x_micro = layer["node_att"](x_micro, edge_index_d, e_micro, batch)
-                e_micro = layer["edge_upd"](x_micro, edge_index_d, e_micro)
-
-            # 🌀 结构熵动态门控融合
-            x_fused, _ = self.spatial_gating(x_macro, x_micro, graph_entropy_scalar)
-
-            return x_fused, e_micro, edge_index_d.clone(), edge_mask, frame_global_ids, graph_entropy_scalar
+        batch_global_ids, batch_graph_irregs = [], []
 
         for t in range(self.seq_len):
-            x, edge_feat, edge_idx_act, e_mask, frame_ids, g_entropy = _spatial_encode_one_frame(graphs[t],
-                                                                                                 self.dropedge_p)
+            x, edge_feat, edge_idx_act, e_mask, frame_ids, g_irreg = self._spatial_encode_one_frame(graphs[t], self.dropedge_p)
             batch_global_ids.append(frame_ids)
             edge_masks.append(e_mask)
             active_edge_indices.append(edge_idx_act)
             spatial_node_feats.append(x)
             spatial_edge_feats.append(edge_feat)
-            batch_graph_entropies.append(g_entropy)
+            batch_graph_irregs.append(g_irreg)
 
-        # === Phase 2: Dynamic Alignment ===
+        # === Phase 2: Dynamic Alignment with Clean Zero-Padding ===
         all_ids = torch.cat(batch_global_ids)
         unique_ids, _ = torch.sort(torch.unique(all_ids))
         num_unique = len(unique_ids)
         device = unique_ids.device
 
+        # 初始化为全 0，缺失节点特征自动为 0，不再做 clone() 污染
         dense_stack = torch.zeros((num_unique, self.seq_len, self.hidden), device=device)
         presence_mask = torch.zeros((num_unique, self.seq_len), device=device, dtype=torch.bool)
 
@@ -325,78 +357,41 @@ class AEGIS(nn.Module):
             dense_stack[indices, t, :] = spatial_node_feats[t]
             presence_mask[indices, t] = True
 
-        decay_weight = torch.sigmoid(self.decay_factor)
-        for t in range(1, self.seq_len):
-            missing_nodes = ~presence_mask[:, t]
-            dense_stack[missing_nodes, t, :] = dense_stack[missing_nodes, t - 1, :].clone() * decay_weight
-
-        # === Phase 3: 熵调节自适应多尺度时序处理 (ER-SKNet) ===
+        # === Phase 3: ER-SKNet (Concatenating Presence Mask) ===
         t_emb = self.tpe(torch.arange(self.seq_len, device=device)).unsqueeze(0)
-        x_temporal_in = dense_stack + t_emb
+        presence_feat = presence_mask.float().unsqueeze(-1)
+        # 时序 CNN 将通过 (特征=0, mask=0) 自主学习出节点缺失的语义规律
+        x_temporal_in = torch.cat([dense_stack + t_emb, presence_feat], dim=-1)
 
-        graph_entropies = torch.stack(batch_graph_entropies)
-        # 求均值并广播至所有节点: [Num_Unique_Nodes, 1]
-        mean_graph_entropy = graph_entropies.mean().unsqueeze(0).expand(num_unique, 1)
-
-        # 转换为 Conv1d 需要的维度: [Batch, Channel, Time]
-        x_temporal_in_permuted = x_temporal_in.permute(0, 2, 1)
-
-        # ✨ 单一自适应时序流，返回特征和核权重(供可视化分析)
-        x_temporal_out, kernel_weights = self.stream_temporal(x_temporal_in_permuted, mean_graph_entropy)
-
-        # 变回 [Batch, Time, Channel]
+        mean_graph_irreg = torch.stack(batch_graph_irregs).mean().unsqueeze(0).expand(num_unique, 1)
+        x_temporal_out, kernel_weights = self.stream_temporal(x_temporal_in.permute(0, 2, 1), mean_graph_irreg)
         dense_out = x_temporal_out.permute(0, 2, 1)
 
-        # === Phase 4 & 5: Readout & Regulated Contrastive Learning ===
-        batch_preds = []
-        cl_loss = torch.tensor(0.0, device=device)
+        # === Phase 4 & 5: Single Frame Readout & Unified Aux Loss ===
+        aux_loss = torch.tensor(0.0, device=device)
+        
+        # [极简监督] 仅对 t_last 读出特征并分类
+        t_last = self.seq_len - 1
+        indices_last = torch.searchsorted(unique_ids, batch_global_ids[t_last])
+        node_out_last = dense_out[indices_last, t_last, :]
+        src, dst = active_edge_indices[t_last][0], active_edge_indices[t_last][1]
+        
+        edge_rep = torch.cat([spatial_edge_feats[t_last], node_out_last[src], node_out_last[dst]], dim=1)
+        logits = self.classifier(edge_rep)
 
-        for t in range(self.seq_len):
-            indices = torch.searchsorted(unique_ids, batch_global_ids[t])
-            node_out_t = dense_out[indices, t, :]
-
-            src, dst = active_edge_indices[t][0], active_edge_indices[t][1]
-            edge_rep = torch.cat([spatial_edge_feats[t], node_out_t[src], node_out_t[dst]], dim=1)
-
-            batch_preds.append(self.classifier(edge_rep))
-
-            if self.training and t == self.seq_len // 2:
-                edge_feat_anchor = spatial_edge_feats[t]
-                if edge_feat_anchor is not None and edge_feat_anchor.size(0) > 0:
-                    if edge_feat_anchor.size(0) > self.max_cl_edges:
-                        perm = torch.randperm(edge_feat_anchor.size(0), device=device)[: self.max_cl_edges]
-                        edge_feat_anchor = edge_feat_anchor[perm]
-                        edge_rep_sampled = edge_rep[perm]
-                    else:
-                        edge_rep_sampled = edge_rep
-
-                    current_entropy = batch_graph_entropies[t].mean()
-                    # 基础掩码率 15%，网络越混乱(熵越高)，掩码率越大，最高可达 60%
-                    dynamic_mask_ratio = torch.clamp(0.15 + 0.45 * torch.tanh(current_entropy), min=0.15, max=0.60)
-                    
-                    # ✨ 2. 特征级掩码投毒 (Feature Masking)
-                    # 模拟真实网络中的丢包、传感器失效或攻击者特征混淆
-                    mask = (torch.rand_like(edge_rep_sampled) > dynamic_mask_ratio).float()
-                    corrupted_rep = edge_rep_sampled * mask
-                    
-                    # ✨ 3. 掩码解码重构 (Masked Reconstruction)
-                    # 强迫模型从被破坏的时空上下文中，还原出纯净的原始物理空间特征
-                    reconstructed = self.reconstruct_head(corrupted_rep)
-                    target_feat = edge_feat_anchor.detach() # 作为绝对的物理真值 (Ground Truth)
-                    
-                    # ✨ 4. MSE 重构损失 (Mean Squared Error)
-                    base_cl_loss = F.mse_loss(reconstructed, target_feat)
-
-                    # ✨ 5. 熵正则化 Loss 放大：环境越混乱，越依赖底层无监督物理规律
-                    dynamic_cl_scale = 1.0 + torch.tanh(current_entropy)
-                    cl_loss = base_cl_loss * dynamic_cl_scale
-                    
-                else:
-                    cl_loss = torch.tensor(0.0, device=device)
+        if self.training:
+            t_aux = self.seq_len // 2
+            if spatial_edge_feats[t_aux] is not None and spatial_edge_feats[t_aux].size(0) > 0:
+                indices_aux = torch.searchsorted(unique_ids, batch_global_ids[t_aux])
+                node_out_aux = dense_out[indices_aux, t_aux, :]
+                src_aux, dst_aux = active_edge_indices[t_aux][0], active_edge_indices[t_aux][1]
+                edge_rep_aux = torch.cat([spatial_edge_feats[t_aux], node_out_aux[src_aux], node_out_aux[dst_aux]], dim=1)
+                
+                # 统一调用 ED-MAE 损失
+                aux_loss = self.compute_aux_loss(edge_rep_aux, spatial_edge_feats[t_aux], batch_graph_irregs[t_aux].mean())
 
         self._last_edge_masks = edge_masks
-
-        # 如果需要，可以将 kernel_weights 存为类属性供外部评价脚本读取
         self._last_kernel_weights = kernel_weights
 
-        return batch_preds, cl_loss
+        # 干净利落地返回 logits 和 aux_loss
+        return logits, aux_loss

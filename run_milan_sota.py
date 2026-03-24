@@ -195,9 +195,9 @@ def get_eval_predictions(model, loader, device):
     for batched_seq in loader:
         batched_seq = [g.to(device) for g in batched_seq]
         out = model(batched_seq)
-        all_preds, _ = out if isinstance(out, tuple) else (out, None)
+        # 直接接收 logits
+        logits, _ = out if isinstance(out, tuple) else (out, None)
         
-        logits = all_preds[-1]
         probs = torch.softmax(logits, dim=-1)
         
         edge_masks = getattr(model, "_last_edge_masks", None)
@@ -314,12 +314,12 @@ def main():
                 
                 # 回归纯正且数学稳定的 FP32 计算
                 out = model(batched_seq)
-                _, cl_loss = out if isinstance(out, tuple) else (out, None)
+                _, aux_loss = out if isinstance(out, tuple) else (out, None)
                 
-                if torch.is_tensor(cl_loss) and cl_loss.requires_grad:
-                    loss = cl_loss / float(accum_steps)
+                if torch.is_tensor(aux_loss) and aux_loss.requires_grad:
+                    loss = aux_loss / float(accum_steps)
                     loss.backward()
-                    total_cl_loss += cl_loss.item()
+                    total_cl_loss += aux_loss.item()
                     cl_steps += 1
                 
                 if ((step + 1) % accum_steps == 0) or ((step + 1) == len(train_loader)):
@@ -371,8 +371,8 @@ def main():
             batched_seq = [g.to(device) for g in batched_seq]
             
             out = model(batched_seq)
-            # 拿到预测结果和对比学习 loss
-            all_preds, cl_loss = out if isinstance(out, tuple) else (out, None)
+            # 拿到预测结果和辅助重构 loss
+            logits, aux_loss = out if isinstance(out, tuple) else (out, None)
             
             edge_masks = getattr(model, "_last_edge_masks", None)
             if edge_masks is not None and len(edge_masks) > 0 and edge_masks[-1] is not None:
@@ -380,14 +380,14 @@ def main():
             else:
                 last_frame_labels = batched_seq[-1].edge_labels
                 
-            # 计算主分类 Loss
-            ce_loss = criterion(all_preds[-1], last_frame_labels)
+            # 计算主分类 Loss (直接使用 logits)
+            ce_loss = criterion(logits, last_frame_labels)
             
             # 联合计算 Total Loss
             batch_total_loss = ce_loss
-            if torch.is_tensor(cl_loss) and cl_loss.requires_grad:
-                batch_total_loss = batch_total_loss + cl_weight * cl_loss
-                total_cl += cl_loss.item()
+            if torch.is_tensor(aux_loss) and aux_loss.requires_grad:
+                batch_total_loss = batch_total_loss + cl_weight * aux_loss
+                total_cl += aux_loss.item()
                 cl_active_steps += 1
                 
             loss = batch_total_loss / float(accum_steps)
