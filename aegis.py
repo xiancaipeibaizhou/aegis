@@ -187,13 +187,13 @@ class FixedTemporalInception(nn.Module):
 # 3. 终极主模型: AEGIS (配置化基类)
 # ==========================================
 class AEGIS(nn.Module):
-    def __init__(self, node_in, edge_in, hidden, num_classes, seq_len=10, heads=8, dropout=0.3, max_cl_edges=2048,
+    def __init__(self, node_in, edge_in, hidden, num_classes, seq_len=10, heads=8, dropout=0.3, 
                  drop_path=0.1, dropedge_p=0.2, kernels=None,
                  use_macro=True, use_micro=True, use_spatial_gating=True, use_edge_aug=True, temporal_mode="adaptive", 
                  **kwargs):
         super(AEGIS, self).__init__()
         self.hidden, self.seq_len = hidden, seq_len
-        self.max_cl_edges, self.dropedge_p = max_cl_edges, float(dropedge_p)
+        self.dropedge_p = float(dropedge_p)
         
         # --- 架构控制开关 ---
         self.use_macro = use_macro
@@ -232,6 +232,11 @@ class AEGIS(nn.Module):
             self.stream_temporal = FixedTemporalInception(hidden + 1, hidden, kernels=kernels)
 
         # --- Phase 4 & 5: Readout ---
+        self.aux_proj = nn.Sequential(
+            nn.Linear(hidden * 3, hidden * 3),
+            nn.LayerNorm(hidden * 3),
+            nn.GELU()
+        )
         self.reconstruct_head = nn.Sequential(nn.Linear(hidden * 3, hidden * 2), nn.ReLU(), nn.Linear(hidden * 2, hidden))
         self.classifier = nn.Sequential(
             nn.Linear(hidden * 3, hidden * 2), nn.LayerNorm(hidden * 2),
@@ -265,17 +270,54 @@ class AEGIS(nn.Module):
         edge_mask = torch.rand_like(keep_prob) < keep_prob 
         return edge_index[:, edge_mask], edge_attr[edge_mask], edge_mask
 
-    def compute_aux_loss(self, edge_rep, target_feat, global_irregularity_scalar):
-        """统一提取的辅助损失：ED-MAE (熵驱动掩码自编码器 MSE 重构)"""
-        dynamic_mask_ratio = torch.clamp(0.15 + 0.45 * torch.tanh(global_irregularity_scalar), min=0.15, max=0.60)
+    def compute_aux_loss(self, edge_rep, target_feat, global_irreg_scalar, src_global_ids, dst_global_ids, batch_ids, local_mask_history):
+        """
+        History-aware edge masking (inspired by DVGMAE) & Latent re-masking (inspired by MGAE)
+        """
+        device = edge_rep.device
+        feat_dim = target_feat.size(1) 
         
-        mask = (torch.rand(edge_rep.size(0), 1, device=edge_rep.device) > dynamic_mask_ratio).float()
-        corrupted_rep = edge_rep * mask
+        # --- 1. DVGMAE-lite: 带有 Batch 隔离的跨时间窗掩码记忆 ---
+        base_mask_ratio = torch.clamp(0.15 + 0.45 * torch.tanh(global_irreg_scalar), min=0.15, max=0.60)
         
-        reconstructed = self.reconstruct_head(corrupted_rep)
+        # 加入 batch_ids 组成三元组 Key，彻底隔离同一个 mini-batch 中不同子图的同名 IP
+        edge_keys = list(zip(batch_ids.tolist(), src_global_ids.tolist(), dst_global_ids.tolist()))
+        hist_values = torch.tensor([local_mask_history.get(k, 0.0) for k in edge_keys], device=device).unsqueeze(-1)
+        
+        # 软衰减：0.5 + 0.5 * (1 - hist)
+        history_factor = 0.5 + 0.5 * (1.0 - hist_values)
+        mask_prob_tensor = torch.clamp(base_mask_ratio * history_factor, 0.05, 0.85)
+
+        # --- 2. 第一重 Mask: 仅遮挡 edge_feat_block ---
+        mask1 = (torch.rand(edge_rep.size(0), 1, device=device) > mask_prob_tensor).float()
+        edge_feat_masked = edge_rep[:, :feat_dim] * mask1
+        
+        edge_rep_corrupted = torch.cat([edge_feat_masked, edge_rep[:, feat_dim:]], dim=1)
+        
+        if self.training:
+            for idx, key in enumerate(edge_keys):
+                is_masked = (mask1[idx, 0].item() == 0.0) 
+                old_hist = local_mask_history.get(key, 0.0)
+                local_mask_history[key] = 0.8 * old_hist + 0.2 * (1.0 if is_masked else 0.0)
+
+        # --- 3. MGAE-lite: 隐空间投影与二次掩码 ---
+        # 先投影到 Latent Space，打散原始特征分布
+        latent = self.aux_proj(edge_rep_corrupted)
+        
+        feat_part = latent[:, :feat_dim]
+        ctx_part  = latent[:, feat_dim:]
+        
+        # 在隐空间中对边特征块做二次破坏
+        re_mask = (torch.rand_like(feat_part) > 0.20).float()
+        feat_part_remasked = feat_part * re_mask
+        
+        latent_remasked = torch.cat([feat_part_remasked, ctx_part], dim=1)
+
+        # --- 4. 解码重构 ---
+        reconstructed = self.reconstruct_head(latent_remasked)
         base_recon_loss = F.mse_loss(reconstructed, target_feat.detach())
-        dynamic_scale = 1.0 + torch.tanh(global_irregularity_scalar)
         
+        dynamic_scale = 1.0 + torch.tanh(global_irreg_scalar)
         return base_recon_loss * dynamic_scale
 
     def _spatial_encode_one_frame(self, data, dropedge_p):
@@ -371,10 +413,10 @@ class AEGIS(nn.Module):
         x_temporal_out, kernel_weights = self.stream_temporal(x_temporal_in.permute(0, 2, 1), mean_graph_irreg)
         dense_out = x_temporal_out.permute(0, 2, 1)
 
-        # === Phase 4 & 5: Single Frame Readout & Unified Aux Loss ===
+        # === Phase 4 & 5: Single Frame Readout & Sequence Aux Loss ===
         aux_loss = torch.tensor(0.0, device=device)
         
-        # [极简监督] 仅对 t_last 读出特征并分类
+        # [主任务] 仅对最后一帧分类
         t_last = self.seq_len - 1
         indices_last = torch.searchsorted(unique_ids, batch_global_ids[t_last])
         node_out_last = dense_out[indices_last, t_last, :]
@@ -384,17 +426,46 @@ class AEGIS(nn.Module):
         logits = self.classifier(edge_rep)
 
         if self.training:
-            t_aux = self.seq_len // 2
-            if spatial_edge_feats[t_aux].size(0) > 0:
-                indices_aux = torch.searchsorted(unique_ids, batch_global_ids[t_aux])
-                node_out_aux = dense_out[indices_aux, t_aux, :]
-                src_aux, dst_aux = active_edge_indices[t_aux][0], active_edge_indices[t_aux][1]
-                edge_rep_aux = torch.cat([spatial_edge_feats[t_aux], node_out_aux[src_aux], node_out_aux[dst_aux]], dim=1)
-                
-                # 统一调用 ED-MAE 损失
-                aux_loss = self.compute_aux_loss(edge_rep_aux, spatial_edge_feats[t_aux], batch_graph_irregs[t_aux])
+            local_mask_history = {}
+            aux_loss_sum = torch.tensor(0.0, device=device)
+            valid_aux_steps = 0
+            
+            for t_aux in range(self.seq_len - 1):
+                if spatial_edge_feats[t_aux].size(0) > 0:
+                    indices_aux = torch.searchsorted(unique_ids, batch_global_ids[t_aux])
+                    node_out_aux = dense_out[indices_aux, t_aux, :]
+                    src_aux, dst_aux = active_edge_indices[t_aux][0], active_edge_indices[t_aux][1]
+                    edge_rep_aux = torch.cat([spatial_edge_feats[t_aux], node_out_aux[src_aux], node_out_aux[dst_aux]], dim=1)
+                    
+                    src_global_ids = batch_global_ids[t_aux][src_aux]
+                    dst_global_ids = batch_global_ids[t_aux][dst_aux]
+                    
+                    # 严密获取 Batch ID 与跨图边界断言
+                    if hasattr(graphs[t_aux], "batch") and graphs[t_aux].batch is not None:
+                        node_batch = graphs[t_aux].batch
+                        batch_ids = node_batch[src_aux]
+                        # 核心防御：一条边的源和目的节点必须属于同一个子图
+                        assert torch.equal(node_batch[src_aux], node_batch[dst_aux]), "Edge crosses graph boundaries unexpectedly."
+                    else:
+                        batch_ids = torch.zeros(src_aux.size(0), dtype=torch.long, device=device)
+                    
+                    step_loss = self.compute_aux_loss(
+                        edge_rep_aux, 
+                        spatial_edge_feats[t_aux], 
+                        batch_graph_irregs[t_aux],
+                        src_global_ids,
+                        dst_global_ids,
+                        batch_ids,
+                        local_mask_history
+                    )
+
+                    aux_loss_sum = aux_loss_sum + step_loss
+                    valid_aux_steps += 1
+            
+            if valid_aux_steps > 0:
+                aux_loss = aux_loss_sum / valid_aux_steps
+
         self._last_edge_masks = edge_masks
         self._last_kernel_weights = kernel_weights
 
-        # 干净利落地返回 logits 和 aux_loss
         return logits, aux_loss
