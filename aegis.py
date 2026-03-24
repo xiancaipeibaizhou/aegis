@@ -268,13 +268,14 @@ class AEGIS(nn.Module):
     def compute_aux_loss(self, edge_rep, target_feat, global_irregularity_scalar):
         """统一提取的辅助损失：ED-MAE (熵驱动掩码自编码器 MSE 重构)"""
         dynamic_mask_ratio = torch.clamp(0.15 + 0.45 * torch.tanh(global_irregularity_scalar), min=0.15, max=0.60)
-        mask = (torch.rand_like(edge_rep) > dynamic_mask_ratio).float()
         
+        mask = (torch.rand(edge_rep.size(0), 1, device=edge_rep.device) > dynamic_mask_ratio).float()
         corrupted_rep = edge_rep * mask
-        reconstructed = self.reconstruct_head(corrupted_rep)
         
+        reconstructed = self.reconstruct_head(corrupted_rep)
         base_recon_loss = F.mse_loss(reconstructed, target_feat.detach())
         dynamic_scale = 1.0 + torch.tanh(global_irregularity_scalar)
+        
         return base_recon_loss * dynamic_scale
 
     def _spatial_encode_one_frame(self, data, dropedge_p):
@@ -283,13 +284,16 @@ class AEGIS(nn.Module):
         x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
         edge_attr = torch.nan_to_num(edge_attr, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # 🚨 严格断言全局稳定实体 ID
+        # Stable cross-frame node identity.
+        # In current dataset builders, `n_id` already stores the hashed global IP identity.
         frame_global_ids = getattr(data, "global_node_id", getattr(data, "n_id", None))
         if frame_global_ids is None:
-            raise ValueError("Missing 'global_node_id' (or 'n_id' as fallback). Temporal alignment strictly requires stable cross-frame entity IDs, not PyG local batch indices.")
-
+            raise ValueError(
+                "Missing stable node identity field. Expected 'global_node_id' or dataset-provided 'n_id'."
+            )
+        
         node_irreg, edge_irreg = self.compute_degree_irregularity(edge_index, x.size(0))
-        graph_irreg_scalar = edge_irreg.mean() if edge_index.size(1) > 0 else torch.tensor(0.0, device=x.device)
+        graph_irreg_scalar = edge_irreg.mean().view(1) if edge_index.size(1) > 0 else x.new_zeros(1)
 
         edge_index_d, edge_attr_d, edge_mask = self.irregularity_guided_dropedge(edge_index, edge_attr, edge_irreg, dropedge_p)
 
@@ -381,15 +385,14 @@ class AEGIS(nn.Module):
 
         if self.training:
             t_aux = self.seq_len // 2
-            if spatial_edge_feats[t_aux] is not None and spatial_edge_feats[t_aux].size(0) > 0:
+            if spatial_edge_feats[t_aux].size(0) > 0:
                 indices_aux = torch.searchsorted(unique_ids, batch_global_ids[t_aux])
                 node_out_aux = dense_out[indices_aux, t_aux, :]
                 src_aux, dst_aux = active_edge_indices[t_aux][0], active_edge_indices[t_aux][1]
                 edge_rep_aux = torch.cat([spatial_edge_feats[t_aux], node_out_aux[src_aux], node_out_aux[dst_aux]], dim=1)
                 
                 # 统一调用 ED-MAE 损失
-                aux_loss = self.compute_aux_loss(edge_rep_aux, spatial_edge_feats[t_aux], batch_graph_irregs[t_aux].mean())
-
+                aux_loss = self.compute_aux_loss(edge_rep_aux, spatial_edge_feats[t_aux], batch_graph_irregs[t_aux])
         self._last_edge_masks = edge_masks
         self._last_kernel_weights = kernel_weights
 

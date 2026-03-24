@@ -195,12 +195,10 @@ def get_eval_predictions(model, loader, device):
     for batched_seq in loader:
         batched_seq = [g.to(device) for g in batched_seq]
         out = model(batched_seq)
-        # 直接接收 logits
         logits, _ = out if isinstance(out, tuple) else (out, None)
-        
         probs = torch.softmax(logits, dim=-1)
-        
         edge_masks = getattr(model, "_last_edge_masks", None)
+        
         if edge_masks is not None and len(edge_masks) > 0 and edge_masks[-1] is not None:
             labels = batched_seq[-1].edge_labels[edge_masks[-1]]
         else:
@@ -358,6 +356,8 @@ def main():
     patience_cnt = 0
     training_log = []
 
+    torch.save(model.state_dict(), os.path.join(save_dir, "best_model.pth"))
+    
     for epoch in range(num_epochs):
         model.train()
         total_loss = 0.0
@@ -371,16 +371,16 @@ def main():
             batched_seq = [g.to(device) for g in batched_seq]
             
             out = model(batched_seq)
-            # 拿到预测结果和辅助重构 loss
             logits, aux_loss = out if isinstance(out, tuple) else (out, None)
             
             edge_masks = getattr(model, "_last_edge_masks", None)
+            # 🌟 这里的严密判断已经帮你把标签对齐了！
             if edge_masks is not None and len(edge_masks) > 0 and edge_masks[-1] is not None:
                 last_frame_labels = batched_seq[-1].edge_labels[edge_masks[-1]]
             else:
                 last_frame_labels = batched_seq[-1].edge_labels
                 
-            # 计算主分类 Loss (直接使用 logits)
+            # 计算主分类 Loss (直接使用 logits 和对齐后的 labels)
             ce_loss = criterion(logits, last_frame_labels)
             
             # 联合计算 Total Loss
