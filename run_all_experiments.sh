@@ -1,13 +1,13 @@
 #!/bin/bash
 
 # 1. 定义你要跑的 4 个数据集 (请根据你的实际文件夹名称修改)
-DATASETS=("unsw_nb15" "cic_ids2017" "iscx_ids2012" "darknet2020_block")
-
+DATASETS=("unsw_nb15")
+# "unsw_nb15" "cic_ids2017" "iscx_ids2012" "darknet2020_block"
 # 2. 定义你要跑的完整模型与消融变体
 VARIANTS=("AEGIS")
-# "WoMacro" "WoMicro" "WoSpatialGating" "WoEdgeAug" "FixedTemporal"
+
 # 3. 环境变量设置 (根据显存大小调整 BATCH_SIZE)
-export BATCH_SIZE=32
+export BATCH_SIZE=128
 export PRETRAIN_EPOCHS=30
 export NUM_EPOCHS=150
 # 创建一个总日志文件夹
