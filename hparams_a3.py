@@ -59,11 +59,11 @@ GROUPS = {
 DATASET_BEST = {
     # Darknet: 暗网隐蔽通信。长时序 (seq=10) 捕获慢速通信闭环；10% 的轻微图扰动作为最佳正则化剥离伪装；
     # 0.5 的动态对比学习权重实现了强鲁棒性。AEGIS 会自适应分配更多权重给大卷积核。
-    "darknet2020": {"SEQ_LEN": 10, "HIDDEN": 128, "HEADS": 8, "DROPEDGE_P": 0.1, "CL_LOSS_WEIGHT": 0.5, "LR": 0.0005, "MAX_CL_EDGES": 4096, "PATIENCE": 30},
+    "darknet2020": {"SEQ_LEN": 10, "HIDDEN": 128, "HEADS": 8, "DROPEDGE_P": 0.1, "CL_LOSS_WEIGHT": 0.5, "LR": 0.0005, "MAX_CL_EDGES": 4096, "PATIENCE": 15},
     
     # NB15: 复杂多步攻击与混合型渗透。短时序 (seq=20) 配合极强的图扰动 (0.4) 撕碎海量背景噪声；
     # AEGIS 根据图熵自动游走于长短感受野，大幅提升了对隐蔽 APT 攻击的拦截率。
-    "nb15":        {"SEQ_LEN": 20, "HIDDEN": 128, "HEADS": 8, "DROPEDGE_P": 0.4, "CL_LOSS_WEIGHT": 0.5, "LR": 0.001,  "MAX_CL_EDGES": 8192, "PATIENCE": 25},
+    "nb15":        {"SEQ_LEN": 10, "HIDDEN": 64, "HEADS": 8, "DROPEDGE_P": 0.1, "CL_LOSS_WEIGHT": 0.5, "LR": 0.001,  "MAX_CL_EDGES": 8192, "PATIENCE": 25},
     
     # IDS2017: 毫秒级瞬间爆发的高频风暴 (DDoS/BruteForce)。坚决不丢边 (Drop=0.0) 以保留脆弱的星型拓扑；
     # AEGIS 感知到极高结构熵时，会自动把 80%+ 的权重锁定在小卷积核 (k=1,3) 上以捕获尖峰。
