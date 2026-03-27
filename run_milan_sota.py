@@ -35,13 +35,18 @@ torch.backends.cudnn.allow_tf32 = True
 # 1. 核心时序数据加载逻辑
 # ==========================================
 class TemporalGraphDataset(torch.utils.data.Dataset):
-    def __init__(self, graph_data_seq, seq_len=10):
+    def __init__(self, graph_data_seq, seq_len=10, stride=1):
         self.graph_data_seq = [g for g in graph_data_seq if g is not None]
         self.seq_len = seq_len
+        self.stride = max(1, int(stride))
+
     def __len__(self):
-        return max(0, len(self.graph_data_seq) - self.seq_len + 1)
+        n = len(self.graph_data_seq) - self.seq_len
+        return 0 if n < 0 else (n // self.stride) + 1
+
     def __getitem__(self, idx):
-        return self.graph_data_seq[idx : idx + self.seq_len]
+        start = idx * self.stride
+        return self.graph_data_seq[start : start + self.seq_len]
 
 def temporal_collate_fn(batch):
     if len(batch) == 0: return []
@@ -189,16 +194,17 @@ def plot_and_save_confusion_matrix(cm, target_names, save_path):
 # 3. 评估获取 Logits
 # ==========================================
 @torch.no_grad()
-def get_eval_predictions(model, loader, device):
+def get_eval_predictions(model, loader, device, use_amp=False, amp_dtype=torch.float16):
     model.eval()
     all_labels, all_probs = [], []
 
     for batched_seq in loader:
-        batched_seq = [g.to(device) for g in batched_seq]
-        out = model(batched_seq)
-        logits, _ = out if isinstance(out, tuple) else (out, None)
+        batched_seq = [g.to(device, non_blocking=True) for g in batched_seq]
+        with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
+            out = model(batched_seq)
+            logits, _ = out if isinstance(out, tuple) else (out, None)
 
-        probs = torch.softmax(logits, dim=-1)
+        probs = torch.softmax(logits.float(), dim=-1)
         labels = batched_seq[-1].edge_labels
 
         all_probs.append(probs.cpu().numpy())
@@ -222,14 +228,18 @@ def main():
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # 1. 先解析超参数，获取字典 h
+    group_str = os.getenv("HP_GROUPS", "NB_EXP1_BASE").split(",")[0].strip()
+    h = resolve_hparams(group_str, env=os.environ, dataset=args.dataset)
+    
+    # 2. 再从 h 中提取 seed 并固定随机种子
     import random
     seed = int(h.get("SEED", 42))
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    group_str = os.getenv("HP_GROUPS", "NB_EXP1_BASE").split(",")[0].strip()
-    h = resolve_hparams(group_str, env=os.environ, dataset=args.dataset)
     
     seq_len = int(h["SEQ_LEN"])
     batch_size = int(h["BATCH_SIZE"])
@@ -254,6 +264,21 @@ def main():
     print(f"📁 Outputs will be saved to: {save_dir}")
 
     dataset_path = os.path.join(args.data_dir, args.dataset)
+    if not os.path.exists(dataset_path):
+        fallback_dataset_path = os.path.join("processed_data", args.dataset)
+        if os.path.exists(fallback_dataset_path):
+            dataset_path = fallback_dataset_path
+        else:
+            raise FileNotFoundError(
+                f"Dataset directory not found: {dataset_path} or {fallback_dataset_path}"
+            )
+
+    use_amp = device.type == 'cuda'
+    amp_dtype = torch.bfloat16 if (use_amp and torch.cuda.is_bf16_supported()) else torch.float16
+    use_grad_scaler = use_amp and amp_dtype == torch.float16
+    scaler_pt = torch.amp.GradScaler('cuda', enabled=use_grad_scaler)
+    scaler_ft = torch.amp.GradScaler('cuda', enabled=use_grad_scaler)
+
     train_graphs = torch.load(os.path.join(dataset_path, "train_graphs.pt"), weights_only=False)
     val_graphs = torch.load(os.path.join(dataset_path, "val_graphs.pt"), weights_only=False)
     test_graphs = torch.load(os.path.join(dataset_path, "test_graphs.pt"), weights_only=False)
@@ -281,8 +306,10 @@ def main():
     node_dim, edge_dim = train_graphs[0].x.shape[1], train_graphs[0].edge_attr.shape[1]
 
     # 🚀 提速优化: DataLoader 多进程并行预加载 + 锁页内存 (抛弃了 AMP，靠 IO 提速)
+    train_stride = int(h.get("TRAIN_STRIDE", 2))
+
     train_loader = DataLoader(
-        TemporalGraphDataset(train_graphs, seq_len),
+        TemporalGraphDataset(train_graphs, seq_len, stride=train_stride),
         batch_size=batch_size,
         shuffle=True,
         collate_fn=temporal_collate_fn,
@@ -291,8 +318,27 @@ def main():
         prefetch_factor=2,
         persistent_workers=True
     )
-    val_loader = DataLoader(TemporalGraphDataset(val_graphs, seq_len), batch_size=batch_size, shuffle=False, collate_fn=temporal_collate_fn, num_workers=4, pin_memory=True)
-    test_loader = DataLoader(TemporalGraphDataset(test_graphs, seq_len), batch_size=batch_size, shuffle=False, collate_fn=temporal_collate_fn, num_workers=4, pin_memory=True)
+
+    val_loader = DataLoader(
+        TemporalGraphDataset(val_graphs, seq_len, stride=1),
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=temporal_collate_fn,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True
+    )
+
+    test_loader = DataLoader(
+        TemporalGraphDataset(test_graphs, seq_len, stride=1),
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=temporal_collate_fn,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True
+    )
+
 
     model_kwargs = {
         "node_in": node_dim, "edge_in": edge_dim, "hidden": hidden, "num_classes": num_classes,
@@ -330,21 +376,30 @@ def main():
             optimizer_pt.zero_grad(set_to_none=True)
             
             for step, batched_seq in enumerate(tqdm(train_loader, desc=f"PT Epoch {epoch+1}", leave=False)):
-                batched_seq = [g.to(device) for g in batched_seq]
-                
-                # 回归纯正且数学稳定的 FP32 计算
-                out = model(batched_seq)
-                _, aux_loss = out if isinstance(out, tuple) else (out, None)
-                
+                batched_seq = [g.to(device, non_blocking=True) for g in batched_seq]
+
+                with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
+                    out = model(batched_seq)
+                    _, aux_loss = out if isinstance(out, tuple) else (out, None)
+
                 if torch.is_tensor(aux_loss) and aux_loss.requires_grad:
                     loss = aux_loss / float(accum_steps)
-                    loss.backward()
+                    if use_grad_scaler:
+                        scaler_pt.scale(loss).backward()
+                    else:
+                        loss.backward()
                     total_cl_loss += aux_loss.item()
                     cl_steps += 1
-                
+
                 if ((step + 1) % accum_steps == 0) or ((step + 1) == len(train_loader)):
+                    if use_grad_scaler:
+                        scaler_pt.unscale_(optimizer_pt)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
-                    optimizer_pt.step()
+                    if use_grad_scaler:
+                        scaler_pt.step(optimizer_pt)
+                        scaler_pt.update()
+                    else:
+                        optimizer_pt.step()
                     optimizer_pt.zero_grad(set_to_none=True)
                     
             scheduler_pt.step()
@@ -392,36 +447,49 @@ def main():
         optimizer_ft.zero_grad(set_to_none=True)
         
         for step, batched_seq in enumerate(tqdm(train_loader, desc=f"FT Epoch {epoch+1}", leave=False)):
-            batched_seq = [g.to(device) for g in batched_seq]
-            
-            out = model(batched_seq)
-            logits, aux_loss = out if isinstance(out, tuple) else (out, None)
-            
-            last_frame_labels = batched_seq[-1].edge_labels
-            ce_loss = criterion(logits, last_frame_labels)
-            
-            # 联合计算 Total Loss
-            batch_total_loss = ce_loss
+            batched_seq = [g.to(device, non_blocking=True) for g in batched_seq]
+
+            with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
+                out = model(batched_seq)
+                logits, aux_loss = out if isinstance(out, tuple) else (out, None)
+
+                last_frame_labels = batched_seq[-1].edge_labels
+                ce_loss = criterion(logits.float(), last_frame_labels)
+
+                batch_total_loss = ce_loss
+                if torch.is_tensor(aux_loss) and aux_loss.requires_grad:
+                    batch_total_loss = batch_total_loss + cl_weight * aux_loss
+
             if torch.is_tensor(aux_loss) and aux_loss.requires_grad:
-                batch_total_loss = batch_total_loss + cl_weight * aux_loss
                 total_cl += aux_loss.item()
                 cl_active_steps += 1
-                
+
             loss = batch_total_loss / float(accum_steps)
-            loss.backward()
-            
+            if use_grad_scaler:
+                scaler_ft.scale(loss).backward()
+            else:
+                loss.backward()
+
             total_loss += batch_total_loss.item()
             total_ce += ce_loss.item()
-                
+
             if ((step + 1) % accum_steps == 0) or ((step + 1) == len(train_loader)):
+                if use_grad_scaler:
+                    scaler_ft.unscale_(optimizer_ft)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
-                optimizer_ft.step()
+                if use_grad_scaler:
+                    scaler_ft.step(optimizer_ft)
+                    scaler_ft.update()
+                else:
+                    optimizer_ft.step()
                 optimizer_ft.zero_grad(set_to_none=True)
 
         scheduler_ft.step()
         
         # ================= SOTA 验证评估 =================
-        val_true, val_probs = get_eval_predictions(model, val_loader, device)
+        val_true, val_probs = get_eval_predictions(
+            model, val_loader, device, use_amp=use_amp, amp_dtype=amp_dtype
+        )
         classes = np.arange(num_classes)
         val_true_bin = label_binarize(val_true, classes=classes)
         
@@ -479,8 +547,12 @@ def main():
     print("\n[Testing] Evaluating Best Model...")
     model.load_state_dict(torch.load(os.path.join(save_dir, "best_model.pth"), map_location=device))
     
-    val_true, val_prob = get_eval_predictions(model, val_loader, device)
-    test_true, test_prob = get_eval_predictions(model, test_loader, device)
+    val_true, val_prob = get_eval_predictions(
+        model, val_loader, device, use_amp=use_amp, amp_dtype=amp_dtype
+    )
+    test_true, test_prob = get_eval_predictions(
+        model, test_loader, device, use_amp=use_amp, amp_dtype=amp_dtype
+    )
     
     normal_indices = get_normal_indices(class_names)
         

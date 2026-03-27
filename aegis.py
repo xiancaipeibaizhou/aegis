@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from collections import OrderedDict
 from torch_geometric.nn import MessagePassing, GraphNorm, GATv2Conv
 from torch_geometric.utils import softmax, degree
 from torch_scatter import scatter
@@ -28,13 +27,13 @@ class DropPath(nn.Module):
 # 1. 空间组件 (统一 Post-Norm 残差风格)
 # ==========================================
 class MacroTopologyGNN(nn.Module):
-    def __init__(self, hidden_dim, dropout=0.1, drop_path=0.1):
+    def __init__(self, hidden_dim, dropout=0.1):
         super().__init__()
         self.conv = GATv2Conv(hidden_dim, hidden_dim // 4, heads=4, concat=True)
         self.norm = GraphNorm(hidden_dim)
         self.act = nn.GELU()
         self.dropout = nn.Dropout(dropout)
-        self.drop_path = DropPath(drop_path)
+        self.drop_path = DropPath(0.1)
 
     def forward(self, x, edge_index, batch=None):
         residual = x
@@ -238,10 +237,7 @@ class AEGIS(nn.Module):
         self.edge_enc = nn.Sequential(nn.Linear(edge_in, hidden), nn.LayerNorm(hidden))
 
         self.num_layers = 2
-        self.macro_spatial_layers = nn.ModuleList([
-            MacroTopologyGNN(hidden, dropout=dropout, drop_path=drop_path)
-            for _ in range(self.num_layers)
-        ])
+        self.macro_spatial_layers = nn.ModuleList([MacroTopologyGNN(hidden, dropout) for _ in range(self.num_layers)])
         self.micro_spatial_layers = nn.ModuleList()
         for _ in range(self.num_layers):
             if self.use_edge_aug:
@@ -258,7 +254,7 @@ class AEGIS(nn.Module):
         self.spatial_gating = SpatialEntropyGating(hidden) if self.use_spatial_gating else None
 
         self.tpe = nn.Embedding(seq_len, hidden)
-        self.edge_tpe = nn.Embedding(seq_len, hidden) # 为边时序分支新增的时间位置编码
+        self.edge_tpe = nn.Embedding(seq_len, hidden) 
         
         if self.temporal_mode == "adaptive":
             self.stream_temporal = AdaptiveTemporalInception(hidden, hidden, kernels=kernels)
@@ -272,9 +268,6 @@ class AEGIS(nn.Module):
         )
         self.reconstruct_head = nn.Sequential(nn.Linear(hidden * 3, hidden * 2), nn.ReLU(), nn.Linear(hidden * 2, hidden))
         
-        self._local_mask_history = OrderedDict()
-        self._max_mask_history = int(kwargs.get("max_mask_history", 50000))
-
         self.edge_temporal = nn.GRU(
             input_size=hidden, hidden_size=hidden, num_layers=1, batch_first=True
         )
@@ -288,16 +281,11 @@ class AEGIS(nn.Module):
         )
 
     # ================= 辅助对齐与记忆函数 =================
-    def _trim_mask_history(self):
-        while len(self._local_mask_history) > self._max_mask_history:
-            self._local_mask_history.popitem(last=False)
-
     def reset_mask_history(self):
-        """建议在每个 Epoch 开始时调用，重置辅助遮挡记忆，避免跨 Epoch 累积偏差"""
-        self._local_mask_history.clear()
+        """兼容旧训练脚本的空操作；当前版本不再维护 Python 掩码历史。"""
+        return None
 
     def _align_node_sequences(self, graphs, spatial_node_feats, raw_global_ids_seq):
-        """[极致优化版] 无 Python 循环的全张量化节点时序对齐"""
         device = spatial_node_feats[0].device
         all_keys = []
         per_t_counts = []
@@ -309,7 +297,6 @@ class AEGIS(nn.Module):
             per_t_counts.append(keys.size(0))
             
         all_keys_tensor = torch.cat(all_keys, dim=0)
-        # 一次性提取全局唯一节点及反向索引，彻底消除 Tuple 和 Dict 的耗时
         unique_keys, inverse_indices = torch.unique(all_keys_tensor, dim=0, return_inverse=True)
         num_unique = unique_keys.size(0)
 
@@ -332,69 +319,79 @@ class AEGIS(nn.Module):
         node_batch_ids = unique_keys[:, 0]
         return dense_stack, presence_mask, node_batch_ids, per_t_node_idx
 
-    def _align_edge_sequences(self, graphs, spatial_edge_feats, active_edge_indices):
-        """基于 (sample_id, edge_uid) 的全张量化边时序对齐"""
+    def _align_target_edge_sequences(self, graphs, spatial_edge_feats, active_edge_indices):
+        """仅为最后一帧需要分类的边回溯历史，避免对窗口内全部 unique edges 做全量对齐。"""
         device = spatial_edge_feats[0].device
-        all_keys = []
-        per_t_counts = []
+        t_last = self.seq_len - 1
 
-        for t in range(self.seq_len):
-            src, _ = active_edge_indices[t]
-            E_t = src.size(0)
-            per_t_counts.append(E_t)
-
-            if E_t > 0:
-                if not hasattr(graphs[t], "edge_uid") or graphs[t].edge_uid is None:
-                    raise ValueError("Each frame must provide `edge_uid` for multigraph-safe edge alignment.")
-
-                edge_uid = graphs[t].edge_uid
-                if edge_uid.size(0) != E_t:
-                    raise ValueError("graphs[t].edge_uid must align with active_edge_indices[t].")
-
-                if hasattr(graphs[t], "batch") and graphs[t].batch is not None:
-                    b_ids = graphs[t].batch[src]
-                else:
-                    b_ids = torch.zeros(E_t, dtype=torch.long, device=device)
-
-                keys = torch.stack([b_ids.long(), edge_uid.long()], dim=1)
-                all_keys.append(keys)
-
-        if sum(per_t_counts) == 0:
+        last_src, _ = active_edge_indices[t_last]
+        num_target_edges = last_src.size(0)
+        if num_target_edges == 0:
             return (
                 torch.zeros((0, self.seq_len, self.hidden), device=device),
                 torch.zeros((0, self.seq_len), device=device, dtype=torch.bool),
-                torch.empty(0, dtype=torch.long, device=device)
             )
 
-        all_keys_tensor = torch.cat(all_keys, dim=0)
-        _, inverse_indices = torch.unique(all_keys_tensor, dim=0, return_inverse=True)
-        num_unique_edges = int(inverse_indices.max().item()) + 1
+        if not hasattr(graphs[t_last], "edge_uid") or graphs[t_last].edge_uid is None:
+            raise ValueError("Each frame must provide `edge_uid` for multigraph-safe edge alignment.")
 
-        edge_dense = torch.zeros((num_unique_edges, self.seq_len, self.hidden), device=device)
-        edge_presence = torch.zeros((num_unique_edges, self.seq_len), device=device, dtype=torch.bool)
+        target_uids = graphs[t_last].edge_uid.long()
+        if target_uids.size(0) != num_target_edges:
+            raise ValueError("graphs[t_last].edge_uid must align with active_edge_indices[t_last].")
 
-        offset = 0
-        last_edge_idx = torch.empty(0, dtype=torch.long, device=device)
+        if hasattr(graphs[t_last], "batch") and graphs[t_last].batch is not None:
+            target_batch = graphs[t_last].batch[last_src].long()
+        else:
+            target_batch = torch.zeros(num_target_edges, dtype=torch.long, device=device)
+
+        target_keys = torch.stack([target_batch, target_uids], dim=1)
+        edge_dense = torch.zeros((num_target_edges, self.seq_len, self.hidden), device=device)
+        edge_presence = torch.zeros((num_target_edges, self.seq_len), device=device, dtype=torch.bool)
 
         for t in range(self.seq_len):
-            E_t = per_t_counts[t]
-            if E_t > 0:
-                idx_t = inverse_indices[offset: offset + E_t]
-                edge_dense[idx_t, t, :] = spatial_edge_feats[t]
-                edge_presence[idx_t, t] = True
-                if t == self.seq_len - 1:
-                    last_edge_idx = idx_t
-            offset += E_t
+            src_t, _ = active_edge_indices[t]
+            E_t = src_t.size(0)
+            if E_t == 0:
+                continue
 
-        # 给边时序补时间位置编码
-        t_idx = torch.arange(self.seq_len, device=device).unsqueeze(0)   # [1, T]
-        edge_tpe_feat = self.edge_tpe(t_idx)                             # [1, T, H]
+            if not hasattr(graphs[t], "edge_uid") or graphs[t].edge_uid is None:
+                raise ValueError("Each frame must provide `edge_uid` for multigraph-safe edge alignment.")
+
+            hist_uids = graphs[t].edge_uid.long()
+            if hist_uids.size(0) != E_t:
+                raise ValueError("graphs[t].edge_uid must align with active_edge_indices[t].")
+
+            if hasattr(graphs[t], "batch") and graphs[t].batch is not None:
+                hist_batch = graphs[t].batch[src_t].long()
+            else:
+                hist_batch = torch.zeros(E_t, dtype=torch.long, device=device)
+
+            hist_keys = torch.stack([hist_batch, hist_uids], dim=1)
+            all_keys = torch.cat([target_keys, hist_keys], dim=0)
+            _, inv = torch.unique(all_keys, dim=0, return_inverse=True)
+
+            inv_target = inv[:num_target_edges]
+            inv_hist = inv[num_target_edges:]
+            sorted_target, target_pos = torch.sort(inv_target)
+            insert_pos = torch.searchsorted(sorted_target, inv_hist)
+
+            valid = insert_pos < num_target_edges
+            valid[valid] = sorted_target[insert_pos[valid]] == inv_hist[valid]
+            if not valid.any():
+                continue
+
+            matched_hist_idx = torch.nonzero(valid, as_tuple=False).squeeze(-1)
+            matched_target_idx = target_pos[insert_pos[valid]]
+
+            edge_dense[matched_target_idx, t, :] = spatial_edge_feats[t][matched_hist_idx]
+            edge_presence[matched_target_idx, t] = True
+
+        t_idx = torch.arange(self.seq_len, device=device).unsqueeze(0)
+        edge_tpe_feat = self.edge_tpe(t_idx)
         edge_dense = edge_dense + edge_tpe_feat * edge_presence.unsqueeze(-1).float()
-
-        return edge_dense, edge_presence, last_edge_idx
+        return edge_dense, edge_presence
 
     def _aggregate_graph_irregularity(self, batch_graph_irregs, num_graphs, device):
-        """修复 Zero-Padding 偏差：只对真实的图存在帧求平均"""
         padded = []
         mask = []
         for g in batch_graph_irregs:
@@ -477,33 +474,20 @@ class AEGIS(nn.Module):
 
         return edge_index[:, edge_mask], edge_attr[edge_mask], edge_mask
 
-    def compute_latent_denoising_loss(self, edge_rep, target_feat, global_irreg_scalar, edge_batch, edge_uid):
-        """Masked Latent Edge Denoising Regularization (history key = (sample_id, edge_uid))"""
+    def compute_latent_denoising_loss(self, edge_rep, target_feat, global_irreg_scalar):
+        """纯张量版 Masked Latent Edge Denoising，去掉 Python 历史字典与 CPU 同步。"""
         device = edge_rep.device
         E = target_feat.size(0)
 
         if E == 0:
             return torch.tensor(0.0, device=device)
 
-        if edge_uid.size(0) != E:
-            raise ValueError("edge_uid must align with target_feat in compute_latent_denoising_loss.")
-
         feat_dim = target_feat.size(1)
-        base_mask_ratio = torch.clamp(
+        mask_prob_tensor = torch.clamp(
             0.15 + 0.45 * torch.tanh(global_irreg_scalar),
             min=0.15,
-            max=0.60
+            max=0.60,
         )
-
-        edge_keys = list(zip(edge_batch.tolist(), edge_uid.tolist()))
-        hist_values = torch.tensor(
-            [self._local_mask_history.get(k, 0.0) for k in edge_keys],
-            device=device,
-            dtype=target_feat.dtype
-        ).unsqueeze(-1)
-
-        history_factor = 0.5 + 0.5 * (1.0 - hist_values)
-        mask_prob_tensor = torch.clamp(base_mask_ratio * history_factor, 0.05, 0.85)
 
         keep_mask = (torch.rand(E, 1, device=device) > mask_prob_tensor).float()
         edge_feat_masked = target_feat * keep_mask
@@ -518,20 +502,9 @@ class AEGIS(nn.Module):
 
         edge_weight = 1.0 + torch.tanh(global_irreg_scalar.squeeze(1))
         masked_edges = 1.0 - keep_mask.squeeze(1)
-
         denom = masked_edges.sum().clamp_min(1.0)
-        masked_loss = (per_edge_loss * edge_weight * masked_edges).sum() / denom
 
-        if self.training:
-            for idx, key in enumerate(edge_keys):
-                is_masked = float(keep_mask[idx, 0].item() == 0.0)
-                old_hist = self._local_mask_history.get(key, 0.0)
-                self._local_mask_history[key] = 0.8 * old_hist + 0.2 * is_masked
-                self._local_mask_history.move_to_end(key)
-
-            self._trim_mask_history()
-
-        return masked_loss
+        return (per_edge_loss * edge_weight * masked_edges).sum() / denom
 
     def _spatial_encode_one_frame(self, data, dropedge_p):
         x, edge_index, edge_attr = data.x, data.edge_index, data.edge_attr
@@ -556,14 +529,13 @@ class AEGIS(nn.Module):
         else:
             graph_irreg_scalar = edge_irreg.mean().view(1) if edge_index.size(1) > 0 else x.new_zeros(1)
 
-        # 仅针对消息传递阶段的 DropEdge
         edge_index_d, edge_attr_d, edge_mask = self.irregularity_guided_dropedge(
             edge_index, edge_attr, edge_irreg, dropedge_p
         )
 
         x_base = self.node_enc(x)
-        e_base = self.edge_enc(edge_attr)  # 保留原始维度，保证所有边有特征
-        e_base_d = e_base[edge_mask]       # 送入图卷积用的稀疏特征
+        e_base = self.edge_enc(edge_attr)  
+        e_base_d = e_base[edge_mask]       
 
         # Macro
         x_macro = x_base
@@ -581,7 +553,6 @@ class AEGIS(nn.Module):
                     x_micro = layer["node_att"](x_micro, edge_index_d, e_base_d, batch)
                 else:
                     x_micro = layer["node_att"](x_micro, edge_index_d, batch)
-                # [关键修复 1]：edge_upd 处理所有的原始边 (edge_index, e_micro)，保证读出口径一致
                 e_micro = layer["edge_upd"](x_micro, edge_index, e_micro)
                 e_base_d = e_micro[edge_mask]
         else:
@@ -596,7 +567,6 @@ class AEGIS(nn.Module):
         else:
             x_fused = x_macro if self.use_macro else x_micro
 
-        # 返回未被 Drop 过的原始边集 (edge_index, e_micro)
         return x_fused, e_micro, edge_index, edge_mask, raw_global_ids, graph_irreg_scalar
 
     def forward(self, graphs):
@@ -615,7 +585,7 @@ class AEGIS(nn.Module):
             )
             raw_global_ids_seq.append(raw_ids)
             edge_masks.append(e_mask)
-            active_edge_indices.append(edge_idx_act)  # 这里装载的已全是原始无损边
+            active_edge_indices.append(edge_idx_act)  
             spatial_node_feats.append(x)
             spatial_edge_feats.append(edge_feat)
             batch_graph_irregs.append(g_irreg)
@@ -655,21 +625,17 @@ class AEGIS(nn.Module):
         # -------------------------
         # Phase 3: Edge alignment + edge temporal encoder
         # -------------------------
-        edge_dense, edge_presence, last_edge_idx = self._align_edge_sequences(
+        edge_dense, edge_presence = self._align_target_edge_sequences(
             graphs, spatial_edge_feats, active_edge_indices
         )
 
         if edge_dense.size(0) > 0:
-            edge_temporal_all, edge_last_hidden, edge_lengths = self._run_edge_temporal(
-                edge_dense, edge_presence
-            )
+            _, edge_last_hidden, _ = self._run_edge_temporal(edge_dense, edge_presence)
         else:
-            edge_temporal_all = torch.zeros((0, self.seq_len, self.hidden), device=device)
             edge_last_hidden = torch.zeros((0, self.hidden), device=device)
-            edge_lengths = torch.zeros((0,), device=device, dtype=torch.long)
 
         # -------------------------
-        # Phase 4: Last-frame readout (无损评测口径对齐)
+        # Phase 4: Last-frame readout
         # -------------------------
         t_last = self.seq_len - 1
         last_node_idx = per_t_node_idx[t_last]
@@ -685,7 +651,7 @@ class AEGIS(nn.Module):
             return logits, aux_loss
 
         edge_temporal_out = (
-            edge_last_hidden[last_edge_idx]
+            edge_last_hidden
             if edge_last_hidden.size(0) > 0
             else spatial_edge_feats[t_last]
         )
@@ -723,22 +689,14 @@ class AEGIS(nn.Module):
                 ], dim=1)
 
                 if hasattr(graphs[t_aux], "batch") and graphs[t_aux].batch is not None:
-                    edge_batch = graphs[t_aux].batch[src_aux]
-                    frame_irreg_scalar = batch_graph_irregs[t_aux][edge_batch]
+                    frame_irreg_scalar = batch_graph_irregs[t_aux][graphs[t_aux].batch[src_aux]]
                 else:
-                    edge_batch = torch.zeros(src_aux.size(0), device=device, dtype=torch.long)
                     frame_irreg_scalar = batch_graph_irregs[t_aux].expand(src_aux.size(0))
-
-                edge_uid_aux = graphs[t_aux].edge_uid
-                if edge_uid_aux.size(0) != spatial_edge_feats[t_aux].size(0):
-                    raise ValueError("graphs[t_aux].edge_uid must align with spatial_edge_feats[t_aux].")
 
                 step_loss = self.compute_latent_denoising_loss(
                     edge_rep=edge_rep_aux,
                     target_feat=spatial_edge_feats[t_aux],
                     global_irreg_scalar=frame_irreg_scalar.unsqueeze(1),
-                    edge_batch=edge_batch,
-                    edge_uid=edge_uid_aux
                 )
 
                 aux_loss_sum = aux_loss_sum + step_loss
