@@ -192,21 +192,18 @@ def plot_and_save_confusion_matrix(cm, target_names, save_path):
 def get_eval_predictions(model, loader, device):
     model.eval()
     all_labels, all_probs = [], []
+
     for batched_seq in loader:
         batched_seq = [g.to(device) for g in batched_seq]
         out = model(batched_seq)
         logits, _ = out if isinstance(out, tuple) else (out, None)
+
         probs = torch.softmax(logits, dim=-1)
-        edge_masks = getattr(model, "_last_edge_masks", None)
-        
-        if edge_masks is not None and len(edge_masks) > 0 and edge_masks[-1] is not None:
-            labels = batched_seq[-1].edge_labels[edge_masks[-1]]
-        else:
-            labels = batched_seq[-1].edge_labels
-            
+        labels = batched_seq[-1].edge_labels
+
         all_probs.append(probs.cpu().numpy())
         all_labels.append(labels.cpu().numpy())
-        
+
     return np.concatenate(all_labels), np.concatenate(all_probs)
 
 # ==========================================
@@ -225,7 +222,12 @@ def main():
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
+    import random
+    seed = int(h.get("SEED", 42))
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
     group_str = os.getenv("HP_GROUPS", "NB_EXP1_BASE").split(",")[0].strip()
     h = resolve_hparams(group_str, env=os.environ, dataset=args.dataset)
     
@@ -256,21 +258,39 @@ def main():
     val_graphs = torch.load(os.path.join(dataset_path, "val_graphs.pt"), weights_only=False)
     test_graphs = torch.load(os.path.join(dataset_path, "test_graphs.pt"), weights_only=False)
 
-    counts = np.zeros(100)
+    label_enc_path = os.path.join(dataset_path, "label_encoder.pkl")
+    if os.path.exists(label_enc_path):
+        class_names = joblib.load(label_enc_path).classes_
+        num_classes = len(class_names)
+    else:
+        max_label = 0
+        for split_graphs in [train_graphs, val_graphs, test_graphs]:
+            for g in split_graphs:
+                if g is not None and g.edge_labels.numel() > 0:
+                    max_label = max(max_label, int(g.edge_labels.max().item()))
+        num_classes = max_label + 1
+        class_names = [f"Class_{i}" for i in range(num_classes)]
+
+    counts = np.zeros(num_classes, dtype=np.float64)
     for g in train_graphs:
-        counts += np.bincount(g.edge_labels.numpy(), minlength=100)
-    num_classes = int(np.max(np.nonzero(counts))) + 1
-    counts = counts[:num_classes]
-    
+        if g is not None and g.edge_labels.numel() > 0:
+            counts += np.bincount(g.edge_labels.cpu().numpy(), minlength=num_classes)
+
     weights_cpu = 1.0 / (np.sqrt(counts) + 1.0)
     weights_cpu = torch.tensor(weights_cpu / weights_cpu.sum() * num_classes, dtype=torch.float32)
-
-    label_enc_path = os.path.join(dataset_path, "label_encoder.pkl")
-    class_names = joblib.load(label_enc_path).classes_ if os.path.exists(label_enc_path) else [f"Class_{i}" for i in range(num_classes)]
     node_dim, edge_dim = train_graphs[0].x.shape[1], train_graphs[0].edge_attr.shape[1]
 
     # 🚀 提速优化: DataLoader 多进程并行预加载 + 锁页内存 (抛弃了 AMP，靠 IO 提速)
-    train_loader = DataLoader(TemporalGraphDataset(train_graphs, seq_len), batch_size=batch_size, shuffle=True, collate_fn=temporal_collate_fn, num_workers=4, pin_memory=True, prefetch_factor=2)
+    train_loader = DataLoader(
+        TemporalGraphDataset(train_graphs, seq_len),
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=temporal_collate_fn,
+        num_workers=4,
+        pin_memory=True,
+        prefetch_factor=2,
+        persistent_workers=True
+    )
     val_loader = DataLoader(TemporalGraphDataset(val_graphs, seq_len), batch_size=batch_size, shuffle=False, collate_fn=temporal_collate_fn, num_workers=4, pin_memory=True)
     test_loader = DataLoader(TemporalGraphDataset(test_graphs, seq_len), batch_size=batch_size, shuffle=False, collate_fn=temporal_collate_fn, num_workers=4, pin_memory=True)
 
@@ -303,6 +323,8 @@ def main():
         scheduler_pt = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer_pt, T_0=10, T_mult=1, eta_min=lr*0.01)
         
         for epoch in range(pretrain_epochs):
+            if hasattr(model, "reset_mask_history"):
+                model.reset_mask_history()
             model.train()
             total_cl_loss, cl_steps = 0.0, 0
             optimizer_pt.zero_grad(set_to_none=True)
@@ -359,6 +381,8 @@ def main():
     torch.save(model.state_dict(), os.path.join(save_dir, "best_model.pth"))
     
     for epoch in range(num_epochs):
+        if hasattr(model, "reset_mask_history"):
+            model.reset_mask_history()
         model.train()
         total_loss = 0.0
         total_ce = 0.0
@@ -373,14 +397,7 @@ def main():
             out = model(batched_seq)
             logits, aux_loss = out if isinstance(out, tuple) else (out, None)
             
-            edge_masks = getattr(model, "_last_edge_masks", None)
-            # 🌟 这里的严密判断已经帮你把标签对齐了！
-            if edge_masks is not None and len(edge_masks) > 0 and edge_masks[-1] is not None:
-                last_frame_labels = batched_seq[-1].edge_labels[edge_masks[-1]]
-            else:
-                last_frame_labels = batched_seq[-1].edge_labels
-                
-            # 计算主分类 Loss (直接使用 logits 和对齐后的 labels)
+            last_frame_labels = batched_seq[-1].edge_labels
             ce_loss = criterion(logits, last_frame_labels)
             
             # 联合计算 Total Loss
@@ -460,7 +477,7 @@ def main():
     # 测试与动态阈值应用
     # ====================
     print("\n[Testing] Evaluating Best Model...")
-    model.load_state_dict(torch.load(os.path.join(save_dir, "best_model.pth")))
+    model.load_state_dict(torch.load(os.path.join(save_dir, "best_model.pth"), map_location=device))
     
     val_true, val_prob = get_eval_predictions(model, val_loader, device)
     test_true, test_prob = get_eval_predictions(model, test_loader, device)
